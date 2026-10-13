@@ -80,13 +80,13 @@ def test_cache_layout_keeps_flash_chunks_inside_one_partition():
 @pytest.fixture(scope="module")
 def tiny_vae():
     torch.manual_seed(0)
-    vae = AutoencoderKLQwenImage21(
+    vae = AutoencoderKLQwenImage21(  # the checkpoint's structure (dim_mult, res blocks, downsampling) with fewer channels
         base_dim=16,
         decoder_base_dim=24,
         z_dim=8,
-        dim_mult=[1, 2, 4, 4],
-        num_res_blocks=1,
-        temperal_downsample=[False, True, True],
+        dim_mult=[1, 2, 4, 8, 8],
+        num_res_blocks=2,
+        temperal_downsample=[False, True, True, True],
         in_channels=4,
         out_channels=4,
         is_residual=True,
@@ -125,3 +125,70 @@ def test_dit_layer_groups_are_balanced_over_devices():
     assert [d for _, d in rt._placement("eager")] == [0, 1, 1, 1]
     rt.devices, rt.reserve = [3], {}
     assert [d for _, d in rt._placement("eager")] == [3, 3, 3, 3]
+
+
+def test_vae_row_tiles_match_untiled(tiny_vae):
+    dec = V.QwenImage21VAEDecoder2D(tiny_vae).eval()
+    gd = {n: F(dec).eval() for n, F, _, _ in V.DECODER_PROGRAM}
+    z = torch.randn(1, 8, 40, 6)
+    full = V.run_program(V.DECODER_PROGRAM, gd, {"z": z})["out"]
+    torch.testing.assert_close(full, dec(z), rtol=1e-4, atol=1e-4)
+    tiled = V.run_program(V.DECODER_PROGRAM, gd, {"z": z}, n_tiles=4)["out"]
+    torch.testing.assert_close(tiled, full, rtol=1e-4, atol=1e-4)
+
+    enc = V.QwenImage21VAEEncoder2D(tiny_vae).eval()
+    ge = {n: F(enc).eval() for n, F, _, _ in V.ENCODER_PROGRAM}
+    x = torch.rand(1, 4, 192, 48) * 2 - 1
+    kw = {"tiled": V.ENC_TILED_STEPS, "halo": V.ENC_TILE_HALO, "base": "x", "unit": V.ENC_TILE_UNIT}
+    full = V.run_program(V.ENCODER_PROGRAM, ge, {"x": x})["z"]
+    torch.testing.assert_close(full, enc(x), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(
+        V.run_program(V.ENCODER_PROGRAM, ge, {"x": x}, n_tiles=3, **kw)["z"], full, rtol=1e-4, atol=1e-4
+    )
+
+
+def _fake_dit():
+    from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_dit import RBLNDiTKV
+
+    rt = RBLNDiTKV.__new__(RBLNDiTKV)
+    rt.models = {
+        "flash": [(0, 32, "f", [("txt", 512), ("img", 4352), ("tgt", 4352)])],
+        "eager": [(0, 32, "e", [("txt", 512), ("img", 4352), ("tgt", 16896)])],
+        "xl": [(0, 32, "x", [("tgt", 16320)])],
+    }
+    rt.prefix_models = {
+        "xl": [(0, 0, 32, "xp", [("txt", 512), ("img", 4352)])],
+        "eager": [(0, 0, 32, "ep", [("txt", 512), ("img", 4352), ("img", 8448), ("img", 12288), ("img", 14336)])],
+    }
+    return rt
+
+
+@pytest.mark.parametrize(
+    "text_lens,cond_grids,tgt_grid,expected",
+    [
+        ([51], [], (64, 64), "flash"),  # 1024² text-to-image
+        ([12] + [5] * 9 + [40], [(64, 64)] * 10, (64, 64), "flash"),  # 1024², 10 references
+        ([60], [], (128, 128), "eager"),  # 2048²
+        ([30, 40], [(96, 96)], (128, 128), "eager"),  # 2048² with a 9216-token condition (output_resolution 1536)
+        ([20, 5, 5, 5, 40], [(64, 64)] * 4, (158, 102), "xl"),  # 2528x1632 with 4 references
+        ([20, 5, 5, 5, 40], [(64, 64)] * 4, (128, 128), None),  # 2048² with 4 references: beyond the compiler limits
+    ],
+)
+def test_dit_cfg_selection(text_lens, cond_grids, tgt_grid, expected):
+    rt = _fake_dit()
+    pad, shapes = _layout(text_lens, cond_grids, tgt_grid)
+    segs = build_segments(pad, shapes)
+    if expected is None:
+        with pytest.raises(ValueError):
+            rt._cfg_for(segs[-1].length, segs)
+    else:
+        assert rt._cfg_for(segs[-1].length, segs) == expected
+
+
+def test_dit_target_goes_after_the_prefixes():
+    rt = _fake_dit()
+    assert rt._tgt_start("flash", 4352, 600) == 600  # fits in the current partition
+    assert rt._tgt_start("flash", 4352, 15000) == 16384  # would cross a partition boundary: next partition
+    assert rt._tgt_start("eager", 16896, 15000) == 15000
+    with pytest.raises(ValueError):
+        rt._tgt_start("eager", 16896, 32256 - 16000)  # no room left in the eager cache

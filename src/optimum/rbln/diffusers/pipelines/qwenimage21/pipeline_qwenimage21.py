@@ -12,24 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen-Image-2.1 (Turbo) pipeline on RBLN NPUs.
+"""Qwen-Image-2.1 (Turbo) pipeline on RBLN NPUs (two CR13 devices).
 
 Every model computation runs on the NPU: the Qwen3-VL text encoder (vision tower + language model), the DiT and the
 VAE encoder/decoder. The host only tokenizes, preprocesses images, builds integer metadata (positions, cache slots,
-masks) and runs the scheduler update. All features of the original pipeline are supported: text-to-image at any
-resolution up to the 2048 class, transparent (RGBA) output, single-image editing, multi-reference editing (up to 10
-images), local edits through annotated images, true CFG with a negative prompt and `use_kv_cache` on/off.
+masks) and runs the scheduler update. Supported: text-to-image at any size up to the 2048 class (all model-card
+presets), transparent (RGBA) output and inputs, single-image, local and multi-reference editing, true CFG with a
+negative prompt, `use_kv_cache` on/off, batches (several prompts and `num_images_per_prompt`) and `output_resolution`
+above 1024. Limits set by the compiler are listed in examples/qwen-image-2.1/README.md.
 
 Design notes (details in the module docstrings):
-- DiT (`dit_kv.py`): prefix (text + condition images) K/V live in device-resident caches written once per request;
-  each denoising step only recomputes the target tokens, exactly like the original `kv_cache_mode` extract/cached.
-  Attention uses `rbln_custom_ops.paged_(flash_)causal_attn_prefill`, causal for text and bidirectional for image
-  blocks, which reproduces the original block-causal mask.
+- DiT (`dit_kv.py`, `runtime_dit.py`): prefix (text + condition images) K/V live in device-resident paged caches written
+  once per request; each step only recomputes the target, exactly like the original `kv_cache_mode` extract/cached.
+  Three cache configurations, one resident at a time: `flash` (1024 class, many references), `eager` (2048 class) and
+  `xl` (targets up to 16320 tokens with long prefixes). Prefix executors that do not fit next to the resident models
+  are compiled as separate prefix-only models sharing the caches and loaded only while a prefix is written.
 - Text encoder (`te_kv.py`): the Qwen3-VL language model runs chunk by chunk over a paged KV cache; image features and
   deepstack features are injected inside the graph; mRoPE tables are gathered inside the graph.
-- VAE (`vae.py`): the Wan-style 3D VAE is rewritten in 2D for single frames and split into a few graphs; each image
-  size is compiled the first time it is used and cached on disk.
-- Precision: the graphs are compiled from fp32 modules so the NPU computes in dlfloat16. SiLU/GELU-tanh use exp-based
+- VAE (`vae.py`): the Wan-style 3D VAE is rewritten in 2D for single frames as a chain of graphs; large sizes run in
+  row tiles with halos (same result); each size is compiled the first time it is used and cached on disk.
+- Device memory: CR13 DRAM is split into 4 chiplets and chiplet 0 receives most scratch memory, so loads are planned
+  against chiplet 0 and components free each other's memory when needed.
+- Reliability: large graphs on CR13 now and then return a different result for the same input; every graph call
+  except the 1024-class DiT is therefore run until two results agree bit for bit.
+- Precision: graphs are compiled from fp32 modules so the NPU computes in dlfloat16. SiLU/GELU-tanh use exp-based
   formulas and the timestep sinusoid uses an exact table lookup, because the default kernels lose accuracy on CR13.
 """
 
@@ -69,11 +75,11 @@ _CONFIG_FILES = [
 ]
 
 
-# Chiplet-0 memory (GiB, measured on CR13) of the parts that share devices with the DiT: text encoder (4.8 + 0.3), vision
-# encoder 2.4 and VAE encoder 3.2 on the aux device; one VAE decoder graph (largest at the 2048 class: 10.0) on the VAE device.
-# CR13 DRAM is split into 4 chiplets of 35 GiB and chiplet 0 receives most scratch memory, so it is the binding budget.
-AUX_CHIPLET0_GIB = 10.7
-VAE_CHIPLET0_GIB = 10.0
+# Chiplet-0 memory (GiB, measured on CR13) of the parts that share devices with the DiT: text encoder (4.8 for text, 3.7 more
+# for the multimodal graph) and vision encoder 2.4 on the aux device; the VAE (encoder 3.2, one decoder graph at a time, largest 7.4 at the 2048 class) on the VAE
+# device. CR13 DRAM is split into 4 chiplets of 35 GiB and chiplet 0 receives most scratch memory: it is the binding budget.
+AUX_CHIPLET0_GIB = 11.0
+VAE_CHIPLET0_GIB = 7.5
 
 
 class _RopeIndexer:
@@ -133,22 +139,39 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
     def maybe_free_model_hooks(self):  # components are NPU runtimes, there is no CPU offload hook
         pass
 
-    # Same inputs/outputs as the original `_get_qwen_prompt_embeds`; only the text encoder call runs on the NPU.
+    # Same inputs/outputs as the original `_get_qwen_prompt_embeds`; the text encoder runs on the NPU, one prompt at a
+    # time. The original encodes a batch with left padding and an attention mask, which gives every prompt the positions
+    # it has alone, so encoding prompts one by one is the same computation; the outputs are then padded like the original.
     def _get_qwen_prompt_embeds(self, prompt=None, image=None, device=None):
         prompt = [prompt] if isinstance(prompt, str) else prompt
-        if len(prompt) != 1:
-            raise NotImplementedError("RBLNQwenImage21Pipeline supports batch size 1.")
-        prompt = [" " if not p else p for p in prompt]
+        prompt = [" " if not p else p for p in prompt]  # Qwen has no bos token
+        embeds, pad_masks = [], []
+        for p in prompt:
+            e, m = self._encode_one(p, image)
+            embeds.append(e)
+            pad_masks.append(m)
+        L = max(e.shape[0] for e in embeds)
+        prompt_embeds = torch.stack([torch.cat([e, e.new_zeros(L - e.shape[0], e.shape[1])]) for e in embeds])
+        attn_mask = torch.stack(
+            [
+                torch.cat([torch.ones(e.shape[0], dtype=torch.long), torch.zeros(L - e.shape[0], dtype=torch.long)])
+                for e in embeds
+            ]
+        )
+        image_pad_mask = torch.stack([torch.cat([m, m.new_zeros(L - m.shape[0])]) for m in pad_masks])
+        return prompt_embeds, attn_mask, image_pad_mask
+
+    def _encode_one(self, prompt, image):
         is_t2i = image is None
         if is_t2i:
-            prompts = [self.prompt_template_t2i.format(t) for t in prompt]
+            text = self.prompt_template_t2i.format(prompt)
             kw = {}
         else:
             replace = "<image1><|vision_start|><|image_pad|><|vision_end|>"
             for i in range(2, len(image) + 1):
                 replace += f" <image{i}><|vision_start|><|image_pad|><|vision_end|>"
             tmpl = self.prompt_template_ti2i.replace("<image1><|vision_start|><|image_pad|><|vision_end|>", replace)
-            prompts = [tmpl.format(t) for t in prompt]
+            text = tmpl.format(prompt)
             imgs = []
             for img in image:
                 if not isinstance(img, PILImage.Image):
@@ -159,7 +182,7 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
                     img = white
                 imgs.append(img)
             kw = {"images": imgs}
-        mi = self.processor(text=prompts, padding=True, padding_side="left", return_tensors="pt", **kw)
+        mi = self.processor(text=[text], padding=True, padding_side="left", return_tensors="pt", **kw)
         ids = mi.input_ids[0]
         L = ids.shape[0]
         if is_t2i:
@@ -175,10 +198,8 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
             hidden = self.te.encode(
                 ids, pos[:, 0].long(), vis_rows=merged, vis_mask=ids == self.image_token_id, deepstack=ds
             )
-        hidden = hidden.to(torch.bfloat16)
-        prompt_embeds = hidden[self._drop_idx :][None]
-        image_pad_mask = (ids == self._img_token_id)[self._drop_idx :][None]
-        return prompt_embeds, None, image_pad_mask
+        # original post-processing: drop the system tokens, image_pad mask
+        return hidden.to(torch.bfloat16)[self._drop_idx :], (ids == self._img_token_id)[self._drop_idx :]
 
     # ------------------------------------------------------------------------------------ load / compile / save
     @staticmethod
@@ -205,9 +226,11 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
         rbln_config keys:
           `dit_device`: device or list of devices for the DiT (default [0, 1]). The 2048-class (eager) graphs need two
             CR13 devices; their 8-layer groups are spread over the list by chiplet-0 memory.
-          `aux_device`: text encoder, vision encoder and VAE encoder (default 0).
-          `vae_device`: VAE decoder (default: the last DiT device; graphs are loaded per call when memory is short).
-          `vae_sizes`: list of [height, width] to precompile (other sizes compile on first use)."""
+          `aux_device`: text encoder and vision encoder (default 0).
+          `vae_device`: VAE (default: the last DiT device; graphs are loaded per call when memory is short).
+          `vae_sizes`: list of [height, width] to precompile (other sizes compile on first use).
+          `local_cache`: local directory for copies of the prefix-only DiT models, which are read on every request that
+            needs them (default ~/.cache/qwenimage21-rbln/prefix; None disables)."""
         rbln_config = dict(rbln_config or {})
         if export:
             save_dir = model_save_dir or os.path.basename(model_id.rstrip("/")) + "-rbln"
@@ -232,12 +255,21 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
             processor=Qwen3VLProcessor.from_pretrained(d, subfolder="processor"),
             te=RBLNTextEncoderKV(os.path.join(d, "te-kv-bank"), device=ad),
             vision=VisionRuntime(d, os.path.join(d, "vision"), device=ad),
-            transformer=RBLNDiTKV(os.path.join(d, "dit-unified"), tcfg, device=dd, reserve=reserve),
-            vae=VAERuntime(d, os.path.join(d, "vae"), device=vd, enc_device=ad),
+            transformer=RBLNDiTKV(
+                os.path.join(d, "dit-unified"),
+                tcfg,
+                device=dd,
+                reserve=reserve,
+                local_cache=rbln_config.get("local_cache", os.path.expanduser("~/.cache/qwenimage21-rbln/prefix")),
+            ),
+            vae=VAERuntime(d, os.path.join(d, "vae"), device=vd, enc_device=vd),
             te_config=te_config,
             sample_sigmas=model_index.get("sample_sigmas"),
         )
-        pipe.transformer.on_oom.append(pipe.vae.free)  # a DiT cfg switch first drops the cached VAE graphs
+        # what the DiT may unload when it needs chiplet 0 (in this order): cached VAE graphs, then the text/vision encoders
+        pipe.transformer.on_oom += [pipe.vae.free, lambda: (pipe.te.free(), pipe.vision.free())]
+        # and what the text/vision encoders may unload: cached VAE graphs, then the DiT (reloaded on its next call)
+        pipe.te.rt.pressure = pipe.vision.pressure = [pipe.vae.free, pipe.transformer.release]
         return pipe
 
     @classmethod
@@ -317,13 +349,18 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
 
     # ------------------------------------------------------------------------------------ timings
     def all_timings(self):
-        out = {}
+        from .runtime_aux import VERIFY_STATS
+
+        out = {"verify_mismatch_aux": VERIFY_STATS["mismatch"]}
         for part in (self.te, self.vision, self.transformer, self.vae):
             for k, v in getattr(part, "timings", {}).items():
                 out[k] = round(sum(v), 3)
         return out
 
     def reset_timings(self):
+        from .runtime_aux import VERIFY_STATS
+
+        VERIFY_STATS["mismatch"] = 0
         for part in (self.te, self.vision, self.transformer, self.vae):
             part.timings = {}
 

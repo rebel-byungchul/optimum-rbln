@@ -524,8 +524,21 @@ def _f4c(f, x):
 # Fine decoder chain: (graph name, module factory, input names, output names). Same ops as VAEChainG1..G4, cut into more graphs.
 # Init/Intermediate scratch adds up over the layers of a graph and a CR13 device holds at most ~64 GiB of it (shared with the
 # DiT), so at the 2048 class the high-resolution part (g3: 28.7 GiB, g4: 21.6 GiB at 2528x1696) is split per resblock.
+class _Stage(nn.Module):
+    def __init__(self, full, stage):
+        super().__init__()
+        self.full, self.stage = full, stage
+
+    def forward(self, x):
+        return QwenImage21VAEDecoderStage(self.full, self.stage)(x)
+
+
 DECODER_PROGRAM = [
-    ("f1", VAEChainG1, ["z"], ["x"]),
+    # f1 (= VAEChainG1) split per stage: as one graph it needed 9.5-10 GiB of chiplet 0 at the 2048 class
+    ("f1h", lambda f: _Stage(f, "head"), ["z"], ["x0"]),
+    ("f1u0", lambda f: _Stage(f, "up0"), ["x0"], ["x1u"]),
+    ("f1u1", lambda f: _Stage(f, "up1"), ["x1u"], ["x2u"]),
+    ("f1u2", lambda f: _Stage(f, "up2"), ["x2u"], ["x"]),
     ("f2", VAEChainG2, ["x"], ["y", "h"]),
     ("f3a", lambda f: _DecStep(f, _f3a), ["y", "h"], ["x1"]),
     ("f3b", lambda f: _DecStep(f, _f3b), ["x1"], ["x2"]),
@@ -537,22 +550,24 @@ DECODER_PROGRAM = [
 ]
 
 
-# The high-resolution tail (f3c..f4c) has only local ops (convs, per-pixel norms, nearest upsample, pixel shuffle), so it can run
-# in row tiles: each tile gets TILE_HALO extra rows (at the 8x-latent scale) on both sides and only its own rows are kept, which
-# gives exactly the untiled result. Its receptive radius is 8 rows at 16x = 4 rows at 8x; the halo is twice that.
-TILED_STEPS = ("f3c", "f3d", "f4a", "f4b", "f4c")
+# Everything after the mid block (f1u1 .. f4c) has only local ops (convs, per-pixel norms, nearest upsample, pixel shuffle),
+# so it can run in row tiles: each tile gets TILE_HALO extra latent rows on both sides and keeps only its own rows, which
+# gives exactly the untiled result. The receptive radius of that tail is about 6.7 latent rows (3.5 from up_blocks[1] at 2x,
+# 1.75 from up_blocks[2] at 4x, ~1.4 from the 8x/16x stages); the halo is 8. Tiles are planned in latent rows and every
+# tensor is sliced at its own scale.
+TILED_STEPS = ("f1u1", "f1u2", "f2", "f3a", "f3b", "f3c", "f3d", "f4a", "f4b", "f4c")
 TILE_HALO = 8
 
 
-def tile_plan(rows, n):
-    """Row windows for n tiles over `rows` rows (8x scale): [(start, keep0, keep1)] with one common window height T."""
+def tile_plan(rows, n, halo=TILE_HALO):
+    """Row windows for n tiles over `rows` rows: (T, [(start, keep0, keep1)]) with one common window height T."""
     if n <= 1:
         return rows, [(0, 0, rows)]
-    T = min(rows, (-(-rows // n) + 2 * TILE_HALO + 7) // 8 * 8)  # multiple of 8 (an odd 475-row tile fails to compile)
+    T = min(rows, -(-rows // n) + 2 * halo)
     plan = []
     for i in range(n):
         b0, b1 = rows * i // n, rows * (i + 1) // n
-        s = min(max(b0 - TILE_HALO, 0), rows - T)
+        s = min(max(b0 - halo, 0), rows - T)
         plan.append((s, b0 - s, b1 - s))
     return T, plan
 
@@ -566,28 +581,50 @@ DECODER_PROGRAM_COARSE = [
 ]
 
 
-def run_program(program, graphs, env, n_tiles=1, use=None):
-    """Run the decoder program; `use(name)` is an optional context manager around each graph (load on demand)."""
+def run_program(program, graphs, env, n_tiles=1, use=None, tiled=TILED_STEPS, halo=TILE_HALO, base="z", unit=1):
+    """Run a chain program; `use(name)` is an optional context manager around each graph (load on demand).
+
+    Steps in `tiled` run in row tiles planned in units of `unit` rows of env[base] (latent rows for the decoder, 16 pixel
+    rows for the encoder), with `halo` units on both sides; every tensor is sliced at its own scale, and the outputs of
+    the last tiled step are stitched back (each tile keeps only its own rows)."""
     from contextlib import nullcontext
 
     use = use or (lambda name: nullcontext())
-    tiles = None
+    if n_tiles > 1:
+        H = env[base].shape[2] // unit
+        T, plan = tile_plan(H, n_tiles, halo)
+    tiles, last_tiled = None, None
     for name, _, ins, outs in program:
+        is_tiled = name in tiled and n_tiles > 1
+        if tiles is not None and not is_tiled:
+            _stitch(env, tiles, last_tiled, T)
+            tiles = None
         with use(name):
-            if name in TILED_STEPS and n_tiles > 1:
-                if tiles is None:  # split the 8x-scale inputs of the first tiled step into row windows
-                    T, plan = tile_plan(env[ins[0]].shape[2], n_tiles)
-                    tiles = [({k: env[k][:, :, s : s + T].contiguous() for k in ins}, k0, k1) for s, k0, k1 in plan]
+            if is_tiled:
+                if tiles is None:  # split the inputs of the first tiled step into row windows (each at its own scale)
+                    tiles = []
+                    for st, k0, k1 in plan:
+                        tenv = {}
+                        for k in ins:
+                            sc = env[k].shape[2] // H
+                            tenv[k] = env[k][:, :, st * sc : (st + T) * sc].contiguous()
+                        tiles.append((tenv, k0, k1))
                 for tenv, _, _ in tiles:
                     res = graphs[name](*[tenv[k] for k in ins])
                     tenv.update(zip(outs, res if isinstance(res, list | tuple) else (res,), strict=True))
+                last_tiled = outs
             else:
                 res = graphs[name](*[env[k] for k in ins])
                 env.update(zip(outs, res if isinstance(res, list | tuple) else (res,), strict=True))
-    if tiles is not None:  # the tail doubles the resolution: keep rows 2*k0 .. 2*k1 of each tile
-        last = program[-1][3][0]
-        env[last] = torch.cat([t[last][:, :, 2 * k0 : 2 * k1] for t, k0, k1 in tiles], dim=2)
+    if tiles is not None:
+        _stitch(env, tiles, last_tiled, T)
     return env
+
+
+def _stitch(env, tiles, keys, T):
+    for key in keys:
+        sc = tiles[0][0][key].shape[2] // T
+        env[key] = torch.cat([t[key][:, :, sc * k0 : sc * k1] for t, k0, k1 in tiles], dim=2)
 
 
 # ------------------------------------------------------------------------------------------ encoder (condition image)
@@ -694,6 +731,14 @@ class QwenImage21VAEEncoderStage(nn.Module):
 
 
 # encoder chain: the graph is cut at the residual add of the channel-changing resblock (down_blocks[1].resnets[0], 96→192 @ H/2) (10-13).
+# Encoder chain as a program. e1..e3 (full and half resolution) have only local ops, so they can run in row tiles planned
+# in units of 16 pixel rows with a 2-unit halo (their receptive radius is about 20 pixels); e4 (low resolution, mid-block
+# attention) runs whole. Tiling is used when a size does not compile in one piece (shape-specific compiler errors, 10-14).
+ENC_TILED_STEPS = ("e1", "e2", "e3")
+ENC_TILE_HALO = 2
+ENC_TILE_UNIT = 16
+
+
 class VAEEncChainE1(nn.Module):
     def __init__(self, enc2d):
         super().__init__()
@@ -764,3 +809,11 @@ class VAEEncChainE4(nn.Module):
             x = QwenImage21VAEEncoderStage(e, f"down{k}")(x)
         x = QwenImage21VAEEncoderStage(e, "mid")(x)
         return QwenImage21VAEEncoderStage(e, "out")(x)
+
+
+ENCODER_PROGRAM = [
+    ("e1", VAEEncChainE1, ["x"], ["x1"]),
+    ("e2", VAEEncChainE2, ["x1"], ["y", "h"]),
+    ("e3", VAEEncChainE3, ["y", "h", "x1"], ["x3"]),
+    ("e4", VAEEncChainE4, ["x3"], ["z"]),
+]

@@ -22,6 +22,7 @@ import time
 
 import torch
 
+from .runtime_aux import run_verified
 from .te_kv import TEConfig, TEKVSegment, TEKVShared
 
 
@@ -122,6 +123,10 @@ class RBLNTextEncoderKV:
         )
         self.timings = {}
 
+    def free(self):
+        """Unload the runtimes to give the device memory to the DiT; the next encode loads them again."""
+        self.rt.free()
+
     def _chain(self, kind, C):
         gs = sorted([g for g in self.graphs if g["kind"] == kind and g["C"] == C], key=lambda g: g["l0"])
         return [(g, self.rt[g["name"]]) for g in gs]
@@ -172,7 +177,9 @@ class RBLNTextEncoderKV:
                     d = torch.zeros(ds_full.shape[0], C, HIDDEN)
                     d[:, :n] = ds_full[:, o : o + n]
                     args.append(d)
-                h = rt.run(*args, pos, cp, bt, mask)
+                h = run_verified(  # a repeat rewrites the same cache rows
+                    lambda rt=rt, args=args, pos=pos, cp=cp, bt=bt, mask=mask: rt.run(*args, pos, cp, bt, mask)
+                )
                 h = h[0] if isinstance(h, list | tuple) else h
             out[o : o + n] = h[:n]
             o += n
