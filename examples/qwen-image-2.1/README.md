@@ -44,18 +44,21 @@ Two compiler constraints measured on rebel-compiler 0.11.3.dev606 shape the DiT:
 cache partitions for chunks of 16384 tokens or more, and the eager paged attention cache must stay below 32768 tokens.
 Requests beyond what the `flash`/`eager`/`xl` caches hold (a 2048-class output with long prefixes) run on the split DiT
 (`xxl`, below), whose cache is bounded by chiplet-0 memory: a 2048-class output with three or more 2048-class
-condition images raises a `ValueError` that says which limit was hit.
+condition images raises a `ValueError` that says which limit was hit. That limit is device memory: the flash op's Init
+scratch grows with query chunk × visible cache (measured: 1.28 GiB for 8448 queries over a 53760-token cache, half for
+half either) and is allocated per graph, so a cache for three 2048-class condition images next to a 2048² target needs
+~62 GiB of Init per device, beyond the ~64 GiB Init + Intermediate a CR13 device accepts and the 35 GiB per chiplet.
 
 Measured end-to-end latency (pipeline call, 8 steps, second run of the same request, two CR13 devices; the
 2048-class DiT and the text/vision/VAE graphs include the repeated runs described under "Reliability"):
 
 | Case | Output | e2e (s) | DiT 8 steps (s) | VAE (s) |
 |---|---|---|---|---|
-| Text-to-image | 1024² | 3.46 | 2.38 | 0.94 |
-| Text-to-image, RGBA | 1024² | 3.56 | 2.42 | 0.98 |
-| Text-to-image + CFG | 1024² | 6.09 | 4.87 | 0.98 |
-| Text-to-image, 2 prompts × 2 images | 4 × 1024² | 14.19 | 9.79 | 3.91 |
-| Edit, 1 / 2 / 10 references | 1024² | 4.78 / 6.13 / 18.80 | 2.70 / 2.94 / 5.98 | 1.16 / 1.39 / 3.22 |
+| Text-to-image | 1024² | 2.86 | 2.38 | 0.33 |
+| Text-to-image, RGBA | 1024² | 2.84 | 2.37 | 0.34 |
+| Text-to-image + CFG | 1024² | 5.11 | 4.58 | 0.33 |
+| Text-to-image, 2 prompts × 2 images | 4 × 1024² | 12.31 | 9.98 | 1.31 |
+| Edit, 1 / 2 / 10 references | 1024² | 4.17 / 5.41 / 18.01 | 2.68 / 2.85 / 6.00 | 0.56 / 0.79 / 2.53 |
 | Text-to-image, model-card presets (7) | 2048 class | 42.7 – 48.1 | 30.0 – 31.6 | 12.0 – 17.4 |
 | Edit, model-card example (yacht sketch) | 2048² | 49.25 | 33.82 | 13.89 |
 | Edit, 4 references (xl) | 2528x1632 | 77.31 | 40.48 | 21.24 |
@@ -103,7 +106,8 @@ and loads it again (~90 s of the totals above, plus ~13 s to reload the text enc
   exp-based formulas, and the timestep sinusoid uses an exact table lookup (`ops.ExactTimestepProj`), because the
   default kernels lose accuracy (SiLU: 6.6 % relative error per token on the text encoder MLP).
 - **Reliability**: large graphs (2048-class DiT layer groups and VAE graphs) now and then return a different result for
-  the same input, sometimes with values far out of range. Every graph call except the 1024-class DiT is therefore run
+  the same input, sometimes with values far out of range. Every graph call except the 1024-class DiT and VAE decoder
+  (0 disagreements in 4800 layer runs / 1200 graph calls) is therefore run
   until two results agree bit for bit (`run_verified`, `RBLNDiTKV._run_group`); a 2048-class request typically has 1 to
   4 disagreements, which are discarded. This doubles the time of the checked graphs.
 - **Memory**: CR13 DRAM is split into 4 chiplets of 35 GiB and chiplet 0 receives most of the scratch memory, which is

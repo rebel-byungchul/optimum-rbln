@@ -355,8 +355,15 @@ class VAERuntime:
                 if isinstance(r, _OnDemand):
                     del live[name]
 
+        # the 1024-class decoder (coarse 4-graph chain) never disagreed with itself (0 in 1200 graph calls, 10-14): run
+        # once, like the 1024-class DiT; every other chain is verified (see run_verified)
+        verify = prog is not V.DECODER_PROGRAM_COARSE
+
         def call(nm, *a):
-            return run_verified(lambda: live[nm].run(*a))  # (see run_verified)
+            if not verify:
+                o = live[nm].run(*a)
+                return o if isinstance(o, list | tuple) else o
+            return run_verified(lambda: live[nm].run(*a))
 
         graphs = {nm: (lambda *a, nm=nm: call(nm, *a)) for nm in rts}
         return V.run_program(prog, graphs, start, n_tiles=n, use=use, **kw)
