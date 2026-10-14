@@ -72,6 +72,11 @@ DiT leaves little room for the text encoder and the large vision bucket on devic
 the prompt and loads it again, and reloads the text and vision encoders (~25-75 s with 2048-class condition images,
 included above).
 
+Accuracy: the 32-layer DiT of every cache configuration was compared with the original transformer on the same inputs
+(CPU fp32, two steps = kv_cache_mode extract/cached): cos 0.9991-0.9999 (flash: text-to-image, 1-2 references, CFG;
+eager: 2048-class text-to-image; xxl: 2048² with a reference). The NPU computes in dlfloat16, so results agree to this
+level rather than bit for bit, as the original's own bf16 runs with and without `use_kv_cache` do.
+
 ## How it works
 
 - **DiT** (`dit_kv.py`, `runtime_dit.py`): text and condition-image tokens are modulated with `t = 0` in Qwen-Image 2.1,
