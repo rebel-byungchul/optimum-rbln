@@ -82,7 +82,10 @@ def load_runtime(path, device, pressure=()):
     if need is not None:
         for free in [None, *pressure]:
             if free is not None:
-                free()
+                if getattr(free, "takes_need", False):  # frees about what is missing (e.g. part of the xxl DiT)
+                    free(device, need + 0.5 - chiplet0_free(device))
+                else:
+                    free()
                 gc.collect()
             if chiplet0_free(device) >= need + 0.3:
                 break

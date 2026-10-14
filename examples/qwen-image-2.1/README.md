@@ -57,20 +57,20 @@ Measured end-to-end latency (pipeline call, 8 steps, second run of the same requ
 | Text-to-image + CFG | 1024² | 5.11 | 4.58 | 0.33 |
 | Text-to-image, 2 prompts × 2 images | 4 × 1024² | 12.31 | 9.98 | 1.31 |
 | Edit, 1 / 2 / 10 references | 1024² | 4.17 / 5.41 / 18.01 | 2.68 / 2.85 / 6.00 | 0.56 / 0.79 / 2.53 |
-| Text-to-image, model-card presets (7) | 2048 class | 42.7 – 48.1 | 30.0 – 31.6 | 12.0 – 17.4 |
-| Edit, model-card example (yacht sketch) | 2048² | 45.55 | 32.81 | 11.25 |
+| Text-to-image, model-card presets (7) | 2048 class | 41.6 – 48.1 | 30.0 – 31.6 | 11.4 – 17.4 |
+| Edit, model-card example (yacht sketch) | 2048² | 44.24 | 31.50 | 11.25 |
 | Edit, 4 references (xl) | 2528x1632 | 77.31 | 40.48 | 21.24 |
-| Edit, `output_resolution=1536` | 1376x1728 | 150.36 | 37.35 | 13.06 |
-| Edit, 4 / 6 references (xxl) | 2048² | 181.99 / 181.99 | 102.24 / 100.97 | 22.20 / 20.67 |
-| Edit, `output_resolution=2048` (yacht sketch, xxl) | 3456x1216 | 182.89 | 93.88 | 21.36 |
-| Edit, 2 / 3 / 6 references at `output_resolution=2048` (xxl) | 2048² | 239.94 / 325.37 / 492.58 | 101.78 / 105.11 / 134.18 | 23.31 / 22.10 / 41.21 |
+| Edit, `output_resolution=1536` | 1376x1728 | 114.56 | 37.38 | 11.13 |
+| Edit, 4 / 6 references (xxl) | 2048² | 152.49 / 152.49 | 95.34 / 90.74 | 17.94 / 20.21 |
+| Edit, `output_resolution=2048` (yacht sketch, xxl) | 3456x1216 | 182.56 | 91.26 | 22.11 |
+| Edit, 2 / 3 / 6 references at `output_resolution=2048` (xxl) | 2048² | 194.69 / 223.19 / 313.27 | 90.22 / 95.55 / 110.28 | 16.76 / 18.23 / 26.32 |
 
 The first request after a switch between cache configurations also loads the other DiT models (16-35 s). Requests that
-use prefix-only models load them while writing the prefix (`output_resolution=1536`: 32 one-layer models, ~50-80 s;
-4 references at 2528x1632: 4 models, ~10 s); they are copied to local disk on first use when there is room. The xxl
-DiT leaves little room for the text encoder and the large vision bucket on device 0: an xxl request unloads it to encode
-the prompt and loads it again, and reloads the text and vision encoders (~25-75 s with 2048-class condition images,
-included above).
+use prefix-only models load them while writing the prefix (`output_resolution=1536`: 32 one-layer models holding only
+the image bucket in use, ~20-30 s; 4 references at 2528x1632: 4 models, ~10 s); they are copied to local disk on first
+use when there is room. The xxl DiT leaves little room for the text encoder and the large vision bucket on device 0:
+these unload only as many xxl layer graphs as they need, which the next DiT call loads again (~5-10 s), and the text
+encoder is loaded again for every xxl request (~15 s).
 
 Accuracy: the 32-layer DiT of every cache configuration was compared with the original transformer on the same inputs
 (CPU fp32, two steps = kv_cache_mode extract/cached): cos 0.9991-0.9999 (flash: text-to-image, 1-2 references, CFG;

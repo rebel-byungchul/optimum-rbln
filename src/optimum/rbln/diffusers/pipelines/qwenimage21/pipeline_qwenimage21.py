@@ -272,8 +272,13 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
         )
         # what the DiT may unload when it needs chiplet 0 (in this order): cached VAE graphs, then the text/vision encoders
         pipe.transformer.on_oom += [pipe.vae.free, lambda: (pipe.te.free(), pipe.vision.free())]
+
         # and what the text/vision encoders may unload: cached VAE graphs, then the DiT (reloaded on its next call)
-        pipe.te.rt.pressure = pipe.vision.pressure = [pipe.vae.free, pipe.transformer.release]
+        def make_room(device, gib):  # part of the xxl DiT (only what is missing), the whole DiT for the other configs
+            pipe.transformer.release_some(device, gib)
+
+        make_room.takes_need = True
+        pipe.te.rt.pressure = pipe.vision.pressure = [pipe.vae.free, make_room, pipe.transformer.release]
         # and the VAE, when even one of its graphs does not fit (2048-class decode next to the xxl DiT): the DiT
         pipe.vae.pressure = [pipe.transformer.release]
         return pipe

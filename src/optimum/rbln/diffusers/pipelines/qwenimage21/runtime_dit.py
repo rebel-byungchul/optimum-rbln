@@ -78,7 +78,9 @@ PREFIX_MODELS = {
     "xl": [([("txt", 512), ("img", 4352)], 8)],
     # eager keeps its prefix executors resident; condition images above 4352 tokens go through these
     # (buckets up to 14336: with the 16896 target region and some text that is all an eager cache of 32256 holds)
-    "eager": [([("txt", 512), ("img", 4352), ("img", 8448), ("img", 12288), ("img", 14336)], 1)],
+    # one family per large bucket: a request loads only the executors it uses (one 1-layer model with all four buckets is
+    # 2.4 GB, so a 32-layer prefix read 77 GB: ~50 s per output_resolution-1536 request, 10-14)
+    "eager": [([("txt", 512), ("img", 4352), ("img", B)], 1) for B in (8448, 12288, 14336)],
 }
 # (cfg, kind, token bucket, layers per graph)
 GRAPHS = [
@@ -278,8 +280,10 @@ class RBLNDiTKV:
         self.verify_stats = {}  # tag -> [verified calls, disagreements]
         self.call_s = {}  # tag -> seconds in runtime calls
         self.on_oom = []  # callables that free other device memory (e.g. cached VAE graphs) before a cfg switch retries
-        for cfg in self.PREFERENCE:  # load the cfg that serves the default 1024 class
-            if cfg in self.models:
+        for (
+            cfg
+        ) in self.PREFERENCE:  # load the cfg that serves the default 1024 class (xxl only on demand: it fills the
+            if cfg in self.models and cfg != "xxl":  # devices, and the pipeline's memory hooks are not attached yet)
                 self._runtimes(cfg)
                 break
 
@@ -299,7 +303,12 @@ class RBLNDiTKV:
         import rebel
 
         if cfg in self.loaded:
-            return self.loaded[cfg]
+            rts = self.loaded[cfg]
+            if any(r is None for r in rts):  # xxl graphs unloaded by release_some: load just those
+                self._reload_missing(cfg)
+            if cfg == "xxl" and self.paged.rts is None:
+                self.paged.bind(rts)
+            return rts
         t0 = time.perf_counter()
         if self.loaded:  # (self._state already describes the request that triggered this load: keep it)
             self.loaded.clear()
@@ -338,6 +347,49 @@ class RBLNDiTKV:
             shutil.copyfile(path, dst + ".part")
             os.replace(dst + ".part", dst)
         return dst
+
+    def release_some(self, device, gib):
+        """Make about `gib` of chiplet 0 free on `device` by unloading xxl layer graphs (last layers first; they hold no
+        caches, so the prefix stays valid) — reloaded by the next call. Other configurations are unloaded whole."""
+        import gc
+
+        if "xxl" not in self.loaded:
+            return self.release()
+        rts, place = self.loaded["xxl"], self.paged.placement()
+        freed = 0.0
+        for i in reversed(range(len(place))):
+            p, d, fe = place[i]
+            if freed >= gib:
+                break
+            if d == device and fe["role"] == "mid" and rts[i] is not None:
+                rts[i] = None
+                freed += self.sizes[p]
+        self.paged.rts = None
+        gc.collect()
+
+    def _reload_missing(self, cfg):
+        import gc
+
+        import rebel
+
+        t0 = time.perf_counter()
+        rts, place = self.loaded[cfg], self.paged.placement()
+        need = {}
+        for (p, d, _), r in zip(place, rts, strict=True):
+            if r is None:
+                need[d] = need.get(d, 0.0) + self.sizes[p] + 0.1
+        for free in [None, *self.on_oom]:
+            if free is not None:
+                free()
+                gc.collect()
+            if all(self._chiplet0_free(d) >= n for d, n in need.items()):
+                break
+        for i, (p, d, _) in enumerate(place):
+            if rts[i] is None:
+                rts[i] = rebel.Runtime(p, tensor_type="pt", device=d)
+        self.paged.rts = None
+        self.load_s += time.perf_counter() - t0
+        self.timings.setdefault("dit_reload_part", []).append(time.perf_counter() - t0)
 
     def release(self):
         """Unload the resident DiT (another component needs the device memory); it is loaded again on its next call."""

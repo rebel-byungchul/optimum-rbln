@@ -300,7 +300,7 @@ class PagedDiT:
         ba, bb = sa // part, sb // part
         n = len(before)
         calls = [
-            (before + [ba], n * part + sa % part, slice(0, P)),  # write A (output not used)
+            ([ba], sa % part, slice(0, P)),  # write A: its own block only (output not used; cost grows with the view)
             (before + [ba, bb], (n + 1) * part + sb % part, slice(P, 2 * P)),  # B attends prefix + A + B
             (before + [bb, ba], (n + 1) * part + sa % part, slice(0, P)),  # A attends prefix + B + A
         ]
@@ -378,10 +378,14 @@ class PagedDiT:
             else:
                 H_, *qkv = self.run_group(g["pre"]["block"], (H_, mod, rope), True, multi=True, tag="pre")
             for li in range(g["l0"], g["l1"]):
-                o = torch.zeros(CB, H, D, dtype=torch.bfloat16)
-                for (a, b), (key, calls, assemble) in zip(spans, plans, strict=True):
-                    part_qkv = [t_[a:b] for t_ in qkv]
-                    o[a:b] = assemble(self._attend(g, li, key, part_qkv, calls, valid))
+                if len(chunks) == 1 and spans[0] == (0, CB):  # one block: its attention output is the whole row block
+                    key, calls, assemble = plans[0]
+                    o = assemble(self._attend(g, li, key, qkv, calls, valid))
+                else:
+                    o = torch.zeros(CB, H, D, dtype=torch.bfloat16)
+                    for (a, b), (key, calls, assemble) in zip(spans, plans, strict=True):
+                        part_qkv = [t_[a:b] for t_ in qkv]
+                        o[a:b] = assemble(self._attend(g, li, key, part_qkv, calls, valid))
                 if li + 1 == self.n_layers:
                     if target:
                         out = self.run_group(g["post"][li], (H_, o, mod, nscale), True, tag="post")
