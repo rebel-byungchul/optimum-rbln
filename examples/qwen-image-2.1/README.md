@@ -34,20 +34,18 @@ VAE graphs are compiled at the exact image size the first time a size is used (2
 | Text-to-image: 1024 class, any size up to the 2048 class, all model-card presets | supported |
 | Transparent (RGBA) output and RGBA inputs | supported |
 | Single-image and local (annotated) editing at 1024 and 2048 class | supported |
-| Multi-reference editing | 1024-class outputs: up to about 14 references; 2048-class outputs (2048² and every preset): up to 6 references at the default `output_resolution` |
-| `output_resolution` up to 2048 (2048-class condition images) | 1024-class outputs and 2048-class outputs with one or two such condition images |
+| Multi-reference editing | up to 20 references of the 1024 class, at 1024-class and 2048-class outputs (2048² and every preset) |
+| `output_resolution` up to 2048 (2048-class condition images) | up to 5 such condition images, also next to a 2048² output |
 | True CFG with a negative prompt, `use_kv_cache=True/False` | supported |
 | Batches (several prompts, `num_images_per_prompt`) | supported (same result as the original: sample 0 equals a single run with the same seed) |
 | Odd latent patch grids (e.g. 2528x1648) | the original transformer fails with a shape error; so does this pipeline |
 
 Two compiler constraints measured on rebel-compiler 0.11.3.dev606 shape the DiT: paged flash attention is wrong across
 cache partitions for chunks of 16384 tokens or more, and the eager paged attention cache must stay below 32768 tokens.
-Requests beyond what the `flash`/`eager`/`xl` caches hold (a 2048-class output with long prefixes) run on the split DiT
-(`xxl`, below), whose cache is bounded by chiplet-0 memory: a 2048-class output with three or more 2048-class
-condition images raises a `ValueError` that says which limit was hit. That limit is device memory: the flash op's Init
-scratch grows with query chunk × visible cache (measured: 1.28 GiB for 8448 queries over a 53760-token cache, half for
-half either) and is allocated per graph, so a cache for three 2048-class condition images next to a 2048² target needs
-~62 GiB of Init per device, beyond the ~64 GiB Init + Intermediate a CR13 device accepts and the 35 GiB per chiplet.
+Requests beyond what the `flash`/`eager`/`xl` caches hold (2048-class outputs with long prefixes) run on the `xxl` DiT
+(below). Its block cache holds 10 prefix blocks of 8960 tokens per layer and context (the limits above); a longer prefix
+raises a `ValueError` that names the limit. With true CFG, a second context that does not fit next to the first is
+rewritten on every call (same result, slower).
 
 Measured end-to-end latency (pipeline call, 8 steps, second run of the same request, two CR13 devices; the
 2048-class DiT and the text/vision/VAE graphs include the repeated runs described under "Reliability"):
@@ -60,19 +58,18 @@ Measured end-to-end latency (pipeline call, 8 steps, second run of the same requ
 | Text-to-image, 2 prompts × 2 images | 4 × 1024² | 12.31 | 9.98 | 1.31 |
 | Edit, 1 / 2 / 10 references | 1024² | 4.17 / 5.41 / 18.01 | 2.68 / 2.85 / 6.00 | 0.56 / 0.79 / 2.53 |
 | Text-to-image, model-card presets (7) | 2048 class | 42.7 – 48.1 | 30.0 – 31.6 | 12.0 – 17.4 |
-| Edit, model-card example (yacht sketch) | 2048² | 49.25 | 33.82 | 13.89 |
+| Edit, model-card example (yacht sketch) | 2048² | 45.55 | 32.81 | 11.25 |
 | Edit, 4 references (xl) | 2528x1632 | 77.31 | 40.48 | 21.24 |
 | Edit, `output_resolution=1536` | 1376x1728 | 150.36 | 37.35 | 13.06 |
-| Edit, 4 references (xxl) | 2048² | 250.39 | 68.53 | 16.50 |
-| Edit, 6 references (xxl) | 2048² | 258.53 | 71.79 | 13.71 |
-| Edit, `output_resolution=2048` (yacht sketch, xxl) | 3456x1216 | 224.59 | 68.44 | 18.01 |
-| Edit, 2 references at `output_resolution=2048` (xxl) | 2048² | 240.90 | 77.13 | 14.10 |
+| Edit, 4 / 6 references (xxl) | 2048² | 166.72 / 173.00 | 95.76 / 98.60 | 15.60 / 17.31 |
+| Edit, `output_resolution=2048` (yacht sketch, xxl) | 3456x1216 | 175.84 | 93.49 | 16.07 |
+| Edit, 2 / 3 references at `output_resolution=2048` (xxl) | 2048² | 204.49 / 238.43 | 105.10 / 112.33 | 14.28 / 15.02 |
 
 The first request after a switch between cache configurations also loads the other DiT models (16-35 s). Requests that
 use prefix-only models load them while writing the prefix (`output_resolution=1536`: 32 one-layer models, ~50-80 s;
-4 references at 2528x1632: 4 models, ~10 s; xxl: 8-16 models, ~25-55 s); they are copied to local disk on first use
-when there is room. The split DiT leaves no room for the text encoder: every xxl request unloads it to encode the prompt
-and loads it again (~90 s of the totals above, plus ~13 s to reload the text encoder).
+4 references at 2528x1632: 4 models, ~10 s); they are copied to local disk on first use when there is room. The xxl
+DiT leaves little room for the text encoder and the large vision bucket on device 0: an xxl request with large condition
+images unloads it to encode the prompt and loads it again (~25 s, included above).
 
 ## How it works
 
@@ -85,11 +82,14 @@ and loads it again (~90 s of the totals above, plus ~13 s to reload the text enc
   - `eager` (one 32256-token block, target 16896): the 2048 class. Condition images above 4352 tokens go through
     prefix-only models loaded for the prefix phase.
   - `xl` (3 × 16384 partitions, target 16320): long prefixes; all prefix executors live in prefix-only models.
-  - `xxl` (`dit_split.py`, `runtime_split.py`; 6 × 8960 partitions): 2048-class targets next to long prefixes. A
-    block above one piece (the target, a 2048-class condition image) is split in two pieces A, B and every layer has
-    two caches X, Y: a head graph writes A to X and B to Y, then the step graph lets B attend in X (prefix + A + B)
-    and A in Y (prefix + B + A), which is the original bidirectional attention with chunks below the flash limit.
-    One graph per layer and kind, so a 2048-class step makes 64 graph calls (~8.5 s per step with the repeated runs).
+  - `xxl` (`dit_paged.py`, `runtime_paged.py`): 2048-class targets next to long prefixes. Per device, one block cache
+    for all of its layers (12 blocks of 8960 tokens per layer) and a few attention graphs without weights, shared by
+    every layer: the block table selects the layer's blocks, so the attention's Init scratch (it grows with query chunk
+    × visible cache and is allocated per graph) exists once per device. The layer computations are per-layer weight
+    graphs; q/k/v and attention outputs pass through the host. A block above one piece (the target, a 2048-class
+    condition image) is split in two pieces A, B of one block each: A's keys/values are written, then B attends over
+    the block order (prefix, A, B) and A over (prefix, B, A) — the original bidirectional attention with chunks below
+    the flash limit. Small prefix chunks are packed so that they share the layer graph calls.
   Batches and CFG give every sample/context its own prefix region and share one target region placed right after the
   prefixes (target keys/values are rewritten on every call).
 - **Text encoder** (`te_kv.py`, `runtime_te.py`): the Qwen3-VL language model runs chunk by chunk over a paged KV cache
@@ -107,7 +107,8 @@ and loads it again (~90 s of the totals above, plus ~13 s to reload the text enc
   default kernels lose accuracy (SiLU: 6.6 % relative error per token on the text encoder MLP).
 - **Reliability**: large graphs (2048-class DiT layer groups and VAE graphs) now and then return a different result for
   the same input, sometimes with values far out of range. Every graph call except the 1024-class DiT and VAE decoder
-  (0 disagreements in 4800 layer runs / 1200 graph calls) is therefore run
+  and the single-op xxl attention graphs (0 disagreements in 4800 layer runs / 1200 graph calls / 1728 attention calls)
+  is therefore run
   until two results agree bit for bit (`run_verified`, `RBLNDiTKV._run_group`); a 2048-class request typically has 1 to
   4 disagreements, which are discarded. This doubles the time of the checked graphs.
 - **Memory**: CR13 DRAM is split into 4 chiplets of 35 GiB and chiplet 0 receives most of the scratch memory, which is

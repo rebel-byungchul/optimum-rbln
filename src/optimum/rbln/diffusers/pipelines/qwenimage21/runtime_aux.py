@@ -48,14 +48,14 @@ def run_verified(fn, max_runs=7):
     never did. The rate varies over time, so it is checked on every call."""
 
     def as_list(o):
-        return [t.clone() for t in o] if isinstance(o, list | tuple) else [o.clone()]
+        return list(o) if isinstance(o, list | tuple) else [o]
 
-    seen = [as_list(fn())]
+    seen = [as_list(fn())]  # rebel.Runtime.run returns new tensors on every call: no copies needed
     while True:
         o = as_list(fn())
         for prev in seen:
             if all(torch.equal(a, b) for a, b in zip(o, prev, strict=True)):
-                return o if len(o) > 1 else o[0]
+                return prev if len(prev) > 1 else prev[0]
         seen.append(o)
         VERIFY_STATS["mismatch"] += 1
         if len(seen) >= max_runs:

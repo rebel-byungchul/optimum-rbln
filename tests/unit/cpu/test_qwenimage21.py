@@ -160,14 +160,13 @@ def _fake_dit(split=False):
         "xl": [(0, 0, 32, "xp", [("txt", 512), ("img", 4352)])],
         "eager": [(0, 0, 32, "ep", [("txt", 512), ("img", 4352), ("img", 8448), ("img", 12288), ("img", 14336)])],
     }
-    if split:  # the split bank (dit_split.py): 2048-class blocks in two pieces over two caches per layer
-        from optimum.rbln.diffusers.pipelines.qwenimage21.dit_split import SPLIT_CFG, SPLIT_P
-        from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_dit import CONFIGS
-        from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_split import DUAL_EXECUTORS
+    if split:  # the xxl bank (dit_paged.py): per-layer weight graphs + shared attention over a block cache
+        from optimum.rbln.diffusers.pipelines.qwenimage21.dit_paged import BLOCKS_PER_LAYER, PART, PIECE
+        from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_paged import PagedDiT
 
-        CONFIGS["xxl"] = SPLIT_CFG
-        rt.split_P = SPLIT_P
-        rt.models["xxl"] = [(0, 32, None, [*DUAL_EXECUTORS, ("img", 2 * SPLIT_P), ("tgt", 2 * SPLIT_P)])]
+        rec = {"l0": 0, "l1": 32, "n_layers": 32, "blocks_per_layer": BLOCKS_PER_LAYER, "part": PART, "piece": PIECE}
+        rt.paged = PagedDiT([(rec, "")], [0], None)
+        rt.models["xxl"] = [(0, 32, None, [("txt", 64), ("txt", 512), ("img", 4352), ("tgt", 2 * PIECE)])]
     return rt
 
 
@@ -183,7 +182,8 @@ def _fake_dit(split=False):
         ([20] + [5] * 5 + [40], [(64, 64)] * 6, (128, 128), "xxl"),  # 2048² with 6 references
         ([30, 40], [(128, 128)], (128, 128), "xxl"),  # 2048² with an output_resolution-2048 condition image
         ([30, 5, 40], [(128, 128)] * 2, (128, 128), "xxl"),  # ... with two of them
-        ([30, 5, 5, 40], [(128, 128)] * 3, (128, 128), None),  # three: beyond the split cache
+        ([30, 5, 5, 5, 40], [(128, 128)] * 4, (128, 128), "xxl"),  # ... with four of them
+        ([30] + [5] * 5 + [40], [(128, 128)] * 6, (128, 128), None),  # six: beyond the block cache
     ],
 )
 def test_dit_cfg_selection(text_lens, cond_grids, tgt_grid, expected):
@@ -197,25 +197,30 @@ def test_dit_cfg_selection(text_lens, cond_grids, tgt_grid, expected):
         assert rt._cfg_for(segs[-1].length, segs) == expected
 
 
-def test_split_inputs_reassemble_the_block():
-    from optimum.rbln.diffusers.pipelines.qwenimage21.dit_split import SPLIT_CFG
+def test_xxl_pieces_and_block_orders():
+    from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_dit import RBLNDiTKV
+    from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_paged import BlockLayout
 
     rt = _fake_dit(split=True)
+    pg = rt.paged
+    P, part = pg.P, pg.part
     N = 16385  # odd: A gets one row more than B
     rows = torch.arange(N, dtype=torch.float32)[:, None].repeat(1, 4)
     rope = torch.arange(N)[None].repeat(3, 1)
-    mask = torch.zeros(2, SPLIT_CFG.cap)
-    s1, s2, _ = rt._split_slots(600)
-    part = SPLIT_CFG.part
-    assert s1 // part == (s1 + rt.split_P - 1) // part and s2 // part == (s2 + rt.split_P - 1) // part and s2 > s1
-    x, r, pos, (nA, nB) = rt._split_inputs(rows, rope, s1, s2, mask)
-    P = rt.split_P
+    x, r, (nA, nB) = RBLNDiTKV._piece_rows(rows, rope, P)
     assert (nA, nB) == (8193, 8192)
     assert torch.equal(torch.cat([x[:nA], x[P : P + nB]]), rows)
     assert torch.equal(torch.cat([r[:, :nA], r[:, P : P + nB]], 1), rope)
-    # X holds A at s1 and B at s2, Y the other way round: each cache has every row once
-    assert mask[0].sum() == mask[1].sum() == N
-    assert mask[0, s1 : s1 + nA].all() and mask[1, s2 : s2 + nA].all()
+    # a text chunk, then a split block: A goes in the text's block, B in the next one
+    lay = BlockLayout(1, 10, part)
+    s = lay.place(64)
+    sa, sb = lay.place(P), lay.place(P)
+    assert (s // part, sa // part, sb // part) == (1, 1, 2)
+    key, calls, _ = pg._layer_calls("block", {"before": lay.blocks_upto(sa)[:-1], "sa": sa, "sb": sb})
+    assert key == "piece"
+    (w_bt, w_seq, _), (b_bt, b_seq, _), (a_bt, a_seq, _) = calls
+    assert w_bt == [1] and b_bt == [1, 2] and a_bt == [2, 1]  # A written; B sees A then B; A sees B then A
+    assert w_seq == sa % part and b_seq == part + sb % part and a_seq == part + sa % part
 
 
 def test_dit_target_goes_after_the_prefixes():
