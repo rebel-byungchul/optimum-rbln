@@ -26,7 +26,9 @@ Design notes (details in the module docstrings):
   once per request; each step only recomputes the target, exactly like the original `kv_cache_mode` extract/cached.
   Three cache configurations, one resident at a time: `flash` (1024 class, many references), `eager` (2048 class) and
   `xl` (targets up to 16320 tokens with long prefixes). Prefix executors that do not fit next to the resident models
-  are compiled as separate prefix-only models sharing the caches and loaded only while a prefix is written.
+  are compiled as separate prefix-only models sharing the caches and loaded only while a prefix is written. A fourth,
+  `xxl` (`dit_split.py`, `runtime_split.py`), serves 2048-class outputs next to long prefixes (several references,
+  output_resolution 2048): blocks above the flash chunk limit are split in two pieces over two caches per layer.
 - Text encoder (`te_kv.py`): the Qwen3-VL language model runs chunk by chunk over a paged KV cache; image features and
   deepstack features are injected inside the graph; mRoPE tables are gathered inside the graph.
 - VAE (`vae.py`): the Wan-style 3D VAE is rewritten in 2D for single frames as a chain of graphs; large sizes run in
@@ -62,6 +64,7 @@ from transformers import AutoConfig, Qwen3VLProcessor
 
 from .runtime_aux import VAERuntime, VisionRuntime
 from .runtime_dit import UNIFIED, RBLNDiTKV, compile_unified
+from .runtime_split import compile_split
 from .runtime_te import RBLNTextEncoderKV, compile_te_bank
 
 
@@ -270,6 +273,8 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
         pipe.transformer.on_oom += [pipe.vae.free, lambda: (pipe.te.free(), pipe.vision.free())]
         # and what the text/vision encoders may unload: cached VAE graphs, then the DiT (reloaded on its next call)
         pipe.te.rt.pressure = pipe.vision.pressure = [pipe.vae.free, pipe.transformer.release]
+        # and the VAE, when even one of its graphs does not fit (2048-class decode next to the split DiT): the DiT
+        pipe.vae.pressure = [pipe.transformer.release]
         return pipe
 
     @classmethod
@@ -291,7 +296,9 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
         with torch.no_grad():
             # DiT: one model with several executors per cfg (eager/flash) and layer group. Models with different layer
             # ranges share no weights, so `parallel=True` compiles them concurrently in subprocesses (60-100 GB RAM each).
+            # (+ the two halves of the split DiT, "xxl": 2048-class outputs next to long prefixes, see runtime_split.py)
             jobs = [(c, l0, l1) for c, (_, groups) in UNIFIED.items() for l0, l1 in groups]
+            jobs += [("xxl", 0, 16), ("xxl", 16, 32)]
             if rbln_config.get("parallel", False):
                 import subprocess
                 import sys
@@ -299,8 +306,11 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
                 code = (
                     "import sys, torch; from diffusers import QwenImage21Transformer2DModel as T; "
                     "from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_dit import compile_unified; "
+                    "from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_split import compile_split; "
                     "m = T.from_pretrained(sys.argv[1], subfolder='transformer', torch_dtype=torch.float32).eval(); "
-                    "compile_unified(m, sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))"
+                    "a, b = int(sys.argv[4]), int(sys.argv[5]); "
+                    "compile_split(m, sys.argv[2], a, b, 32) if sys.argv[3] == 'xxl' else "
+                    "compile_unified(m, sys.argv[2], sys.argv[3], a, b)"
                 )
                 procs = [
                     subprocess.Popen(
@@ -324,7 +334,10 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
                     snapshot, subfolder="transformer", torch_dtype=torch.float32
                 ).eval()
                 for c, l0, l1 in jobs:
-                    compile_unified(dit, os.path.join(save_dir, "dit-unified"), c, l0, l1, log=log)
+                    if c == "xxl":
+                        compile_split(dit, os.path.join(save_dir, "dit-unified"), l0, l1, 32, log=log)
+                    else:
+                        compile_unified(dit, os.path.join(save_dir, "dit-unified"), c, l0, l1, log=log)
                 del dit
             te = Qwen3VLForConditionalGeneration.from_pretrained(
                 snapshot, subfolder="text_encoder", dtype=torch.float32, attn_implementation="sdpa"

@@ -34,16 +34,17 @@ VAE graphs are compiled at the exact image size the first time a size is used (2
 | Text-to-image: 1024 class, any size up to the 2048 class, all model-card presets | supported |
 | Transparent (RGBA) output and RGBA inputs | supported |
 | Single-image and local (annotated) editing at 1024 and 2048 class | supported |
-| Multi-reference editing | 1024-class outputs: up to about 14 references; outputs up to 16320 tokens (e.g. 2528x1632): up to 6 references; 2048² and the other presets above 16384 tokens: up to 3 references |
-| `output_resolution` above 1024 (larger condition images) | condition images up to 14336 tokens (about 1900²) |
+| Multi-reference editing | 1024-class outputs: up to about 14 references; 2048-class outputs (2048² and every preset): up to 6 references at the default `output_resolution` |
+| `output_resolution` up to 2048 (2048-class condition images) | 1024-class outputs and 2048-class outputs with one or two such condition images |
 | True CFG with a negative prompt, `use_kv_cache=True/False` | supported |
 | Batches (several prompts, `num_images_per_prompt`) | supported (same result as the original: sample 0 equals a single run with the same seed) |
 | Odd latent patch grids (e.g. 2528x1648) | the original transformer fails with a shape error; so does this pipeline |
 
-The limits in the multi-reference and `output_resolution` rows come from two compiler constraints measured on
-rebel-compiler 0.11.3.dev606: paged flash attention is wrong across cache partitions for chunks of 16384 tokens or more,
-and the eager paged attention cache must stay below 32768 tokens. A request beyond them raises a `ValueError` that says
-which limit was hit.
+Two compiler constraints measured on rebel-compiler 0.11.3.dev606 shape the DiT: paged flash attention is wrong across
+cache partitions for chunks of 16384 tokens or more, and the eager paged attention cache must stay below 32768 tokens.
+Requests beyond what the `flash`/`eager`/`xl` caches hold (a 2048-class output with long prefixes) run on the split DiT
+(`xxl`, below), whose cache is bounded by chiplet-0 memory: a 2048-class output with three or more 2048-class
+condition images raises a `ValueError` that says which limit was hit.
 
 Measured end-to-end latency (pipeline call, 8 steps, second run of the same request, two CR13 devices; the
 2048-class DiT and the text/vision/VAE graphs include the repeated runs described under "Reliability"):
@@ -59,10 +60,16 @@ Measured end-to-end latency (pipeline call, 8 steps, second run of the same requ
 | Edit, model-card example (yacht sketch) | 2048² | 49.25 | 33.82 | 13.89 |
 | Edit, 4 references (xl) | 2528x1632 | 77.31 | 40.48 | 21.24 |
 | Edit, `output_resolution=1536` | 1376x1728 | 150.36 | 37.35 | 13.06 |
+| Edit, 4 references (xxl) | 2048² | 250.39 | 68.53 | 16.50 |
+| Edit, 6 references (xxl) | 2048² | 258.53 | 71.79 | 13.71 |
+| Edit, `output_resolution=2048` (yacht sketch, xxl) | 3456x1216 | 224.59 | 68.44 | 18.01 |
+| Edit, 2 references at `output_resolution=2048` (xxl) | 2048² | 240.90 | 77.13 | 14.10 |
 
 The first request after a switch between cache configurations also loads the other DiT models (16-35 s). Requests that
 use prefix-only models load them while writing the prefix (`output_resolution=1536`: 32 one-layer models, ~50-80 s;
-4 references at the 2048 class: 4 models, ~10 s); they are copied to local disk on first use.
+4 references at 2528x1632: 4 models, ~10 s; xxl: 8-16 models, ~25-55 s); they are copied to local disk on first use
+when there is room. The split DiT leaves no room for the text encoder: every xxl request unloads it to encode the prompt
+and loads it again (~90 s of the totals above, plus ~13 s to reload the text encoder).
 
 ## How it works
 
@@ -75,6 +82,11 @@ use prefix-only models load them while writing the prefix (`output_resolution=15
   - `eager` (one 32256-token block, target 16896): the 2048 class. Condition images above 4352 tokens go through
     prefix-only models loaded for the prefix phase.
   - `xl` (3 × 16384 partitions, target 16320): long prefixes; all prefix executors live in prefix-only models.
+  - `xxl` (`dit_split.py`, `runtime_split.py`; 6 × 8960 partitions): 2048-class targets next to long prefixes. A
+    block above one piece (the target, a 2048-class condition image) is split in two pieces A, B and every layer has
+    two caches X, Y: a head graph writes A to X and B to Y, then the step graph lets B attend in X (prefix + A + B)
+    and A in Y (prefix + B + A), which is the original bidirectional attention with chunks below the flash limit.
+    One graph per layer and kind, so a 2048-class step makes 64 graph calls (~8.5 s per step with the repeated runs).
   Batches and CFG give every sample/context its own prefix region and share one target region placed right after the
   prefixes (target keys/values are rewritten on every call).
 - **Text encoder** (`te_kv.py`, `runtime_te.py`): the Qwen3-VL language model runs chunk by chunk over a paged KV cache

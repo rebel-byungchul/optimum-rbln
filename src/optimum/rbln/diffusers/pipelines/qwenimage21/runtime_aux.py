@@ -156,6 +156,7 @@ class VAERuntime:
         self.config = FrozenDict(cfg)
         self.dtype = torch.bfloat16
         self._vae = None  # CPU weights are loaded only when compiling
+        self.pressure = []  # callables that free other components' device memory (set by the pipeline)
         self._dec = _LRU(keep)
         self._enc = _LRU(keep)
         self.timings = {}
@@ -183,9 +184,9 @@ class VAERuntime:
         enc_kw = {"tiled": V.ENC_TILED_STEPS, "halo": V.ENC_TILE_HALO, "base": "x", "unit": V.ENC_TILE_UNIT}
         return [("enc5", V.ENCODER_PROGRAM, n) for n in (1, 2, 3, 4, 6)], enc_kw
 
-    def _chain(self, kind, H, W):
+    def _chain(self, kind, H, W, min_tiles=1):
         """Compile (once, cached on disk) and return (dir, program, n_tiles, tiling kwargs) for a chain at size H×W
-        (latent size for the decoder, pixels for the encoder)."""
+        (latent size for the decoder, pixels for the encoder), with at least `min_tiles` row tiles."""
         import shutil
 
         import rebel
@@ -197,6 +198,8 @@ class VAERuntime:
         halo, unit = kw.get("halo", V.TILE_HALO), kw.get("unit", 1)
         rows = H // unit
         for tag, prog, n in cands:
+            if n < min_tiles:
+                continue
             T = V.tile_plan(rows, n, halo)[0]
             d = os.path.join(self.cache_dir, f"vae-{tag}-{H}x{W}" + (f"-t{n}x{T}" if n > 1 else ""))
             files = [os.path.join(d, f"{nm}.rbln") for nm, _, _, _ in prog]
@@ -258,10 +261,29 @@ class VAERuntime:
         d, prog, n, kw = self._chain("dec", H, W)
         names = [nm for nm, _, _, _ in prog]
         self._dec.make_room()
+        # next to a large resident DiT (the split one leaves ~4 GiB of chiplet 0) the largest graph of a 2048-class decoder
+        # may not fit: smaller row tiles (more of them, same result) before `pressure` unloads the DiT
+        free = self._chiplet0_free(self.device) - 0.5
+        for more in (6, 8):
+            if n >= more or max(self._chiplet0_gib([os.path.join(d, f"{nm}.rbln") for nm in names])) <= free:
+                break
+            try:
+                d, prog, n, kw = self._chain("dec", H, W, min_tiles=more)
+            except RuntimeError:
+                break
         rts = dict(zip(names, self._load([os.path.join(d, f"{nm}.rbln") for nm in names]), strict=True))
         hit = (rts, prog, n, kw)
         self._dec.put(key, hit)
         return hit
+
+    @staticmethod
+    def _chiplet0_free(device):
+        import gc
+
+        from rebel.device_info import get_device_memory_info
+
+        gc.collect()
+        return get_device_memory_info(device).chiplets[0].free / 2**30
 
     @staticmethod
     def _chiplet0_gib(files):
@@ -291,6 +313,16 @@ class VAERuntime:
         gc.collect()
         need = self._chiplet0_gib(files)
         free = get_device_memory_info(device).chiplets[0].free / 2**30 - 0.5  # margin
+        if sum(need) <= free:
+            return [rebel.Runtime(f, tensor_type="pt", device=device) for f in files]
+        for (
+            release
+        ) in self.pressure:  # not even the largest graph fits (e.g. 2048² next to the split DiT): free others
+            if max(need) <= free:
+                break
+            release()
+            gc.collect()
+            free = get_device_memory_info(device).chiplets[0].free / 2**30 - 0.5
         if sum(need) <= free:
             return [rebel.Runtime(f, tensor_type="pt", device=device) for f in files]
         self.log(

@@ -213,7 +213,8 @@ class RBLNDiTKV:
     # flash first: it covers the 1024 class (targets ≤ 4352 tokens, up to 10 references) and leaves room for the VAE. eager
     # is loaded only for larger targets. One cfg is resident at a time: a switch unloads the other one (and cached VAE graphs)
     # before loading, since a load that fails half way does not give its device memory back (10-14).
-    PREFERENCE = ("flash", "eager", "xl")
+    # xxl (split blocks, two caches per layer, one graph per layer) is the slowest and serves what the others cannot hold.
+    PREFERENCE = ("flash", "eager", "xl", "xxl")
 
     def __init__(
         self, bank_dir, config: dict, device: int = 0, reserve: dict | None = None, local_cache: str | None = None
@@ -221,6 +222,7 @@ class RBLNDiTKV:
         dirs = [bank_dir] if isinstance(bank_dir, str) else list(bank_dir)
         self.bank_dir = dirs[0]
         self.models = {}  # cfg -> [(l0, l1, path, executors)]
+        self.split_halves = []  # xxl: [(l0, l1, [(file record, path)])] (runtime_split.py)
         self.prefix_models = {}  # cfg -> [(family, l0, l1, path, executors)] (see PREFIX_MODELS)
         self.local_cache = local_cache  # local directory for copies of the prefix models (see _local)
         self.sizes = {}  # path -> chiplet-0 memory (GiB, from the compile record)
@@ -231,6 +233,9 @@ class RBLNDiTKV:
             for f in sorted(os.listdir(d)):
                 if f.endswith(".json") and not f.startswith("manifest"):
                     e = json.load(open(os.path.join(d, f)))
+                    if e.get("split"):  # split DiT half (runtime_split.py)
+                        self._add_split_half(d, e)
+                        continue
                     path = os.path.join(d, e["name"] + ".rbln")
                     self.models.setdefault(e["cfg"], []).append(
                         (e["l0"], e["l1"], path, [tuple(x) for x in e["executors"]])
@@ -258,6 +263,7 @@ class RBLNDiTKV:
 
         self.config = FrozenDict(config)
         n_layers = max(m[-1][1] for m in self.models.values())
+        self.n_layers = n_layers
         self.transformer_blocks = [None] * n_layers
         self.dtype = torch.bfloat16
         self._ctx = "cond"
@@ -266,7 +272,7 @@ class RBLNDiTKV:
         self.load_s = 0.0
         # cfgs whose model runs are verified by repetition (see _run_group): the 2048-class models. The 1024-class flash
         # models never disagreed in 4800 layer runs and every repeated request, so they run once (add "flash" to check them)
-        self.verify = {"eager", "xl"}
+        self.verify = {"eager", "xl", "xxl"}
         self.on_oom = []  # callables that free other device memory (e.g. cached VAE graphs) before a cfg switch retries
         for cfg in self.PREFERENCE:  # load the cfg that serves the default 1024 class
             if cfg in self.models:
@@ -294,7 +300,7 @@ class RBLNDiTKV:
         if self.loaded:  # (self._state already describes the request that triggered this load: keep it)
             self.loaded.clear()
             gc.collect()
-        place = self._placement(cfg)
+        place = self._split_placement() if cfg == "xxl" else self._placement(cfg)
         need = {}
         for p, d in place:
             need[d] = need.get(d, 0.0) + self.sizes[p] + 0.3
@@ -391,21 +397,21 @@ class RBLNDiTKV:
         it is not reproducible at op level and looks like a runtime/hardware issue. Re-running is safe: a run rewrites the
         same cache positions with the same values."""
 
-        def once():
+        def once():  # all outputs (split head graphs also return a check of their cache writes)
             o = rt.run(*args)
-            return (o[0] if isinstance(o, list | tuple) else o).clone()
+            return [x.clone() for x in o] if isinstance(o, list | tuple) else [o.clone()]
 
         first = once()
         if not verify:
-            return first
+            return first[0]
         seen = [first]
         while True:
             o = once()
             for prev in seen:
-                if torch.equal(o, prev):
+                if all(torch.equal(a, b) for a, b in zip(o, prev, strict=True)):
                     if len(seen) > 1:
                         self.timings.setdefault("dit_verify_mismatch", []).append(float(len(seen) - 1))
-                    return o
+                    return o[0]
             seen.append(o)
             if len(seen) > 6:
                 raise RuntimeError("DiT model output does not repeat over 7 runs")
@@ -562,6 +568,8 @@ class RBLNDiTKV:
         return (torch.stack(outs).to(torch.bfloat16),)
 
     def _tgt_start(self, cfg, C_t, prefix_end):
+        if cfg == "xxl":
+            return self._split_slots(prefix_end)[0]
         """Where the target goes: right after the prefixes (attention cost grows with the position, since a chunk attends
         to cache positions before its end). Its K/V are rewritten on every call, so it can move as contexts are added.
         Raises ValueError if it does not fit."""
@@ -579,6 +587,10 @@ class RBLNDiTKV:
                     big = max(self._buckets(cfg, "txt"))
                     for o in range(0, s.length, big):
                         lay.place(self._pick(cfg, "txt", min(big, s.length - o)))
+                elif s.kind == "img" and cfg == "xxl" and s.length > self._small_img:
+                    if s.length > 2 * self.split_P:
+                        raise ValueError(f"condition image of {s.length} tokens > {2 * self.split_P}")
+                    self._place_pieces(lay)
                 elif s.kind == "img":
                     lay.place(self._pick(cfg, "img", s.length))
             end = lay.cursor
@@ -590,6 +602,8 @@ class RBLNDiTKV:
     def _call_one(self, key, hs, t, enc_all, enc_mask, layout, segs, kv_cache_mode):
         st_all = self._state
         cfg = st_all["cfg"]
+        if cfg == "xxl":
+            return self._call_one_split(key, hs, t, enc_all, enc_mask, layout, segs, kv_cache_mode)
         tgt = segs[-1]
         N = tgt.length
         n_cond = hs.shape[0] - N
@@ -633,6 +647,229 @@ class RBLNDiTKV:
         )
         self._tick("dit_target", t0)
         return out[:N]
+
+    # ------------------------------------------------------------------ xxl: split blocks (dit_split.py, runtime_split.py)
+    _small_img = 4352  # xxl: condition images up to this many tokens are one chunk (dual models), larger ones split
+
+    def _add_split_half(self, d, e):
+        from .runtime_split import DUAL_EXECUTORS
+
+        files = []
+        for fe in e["files"]:
+            path = os.path.join(d, fe["name"] + ".rbln")
+            self.sizes[path] = fe["chiplet_gib"][0]
+            files.append((fe, path))
+        self.split_halves.append((e["l0"], e["l1"], files))
+        self.split_halves.sort(key=lambda h: h[0])
+        self.split_P = e["P"]
+        CONFIGS["xxl"] = KVConfig(**e["kv"])
+        execs = [tuple(x) for x in DUAL_EXECUTORS] + [("img", 2 * e["P"]), ("tgt", 2 * e["P"])]
+        self.models["xxl"] = [(a, b, None, execs) for a, b, _ in self.split_halves]
+
+    def _split_placement(self):
+        """Half i of the split bank goes to device i (wrapping around): a half's files share weights only with each other.
+        Dual (prefix) models are not resident: _prefix_split loads them one at a time."""
+        return [
+            (p, self.devices[i % len(self.devices)])
+            for i, (_, _, files) in enumerate(self.split_halves)
+            for fe, p in files
+            if fe["role"] != "dual"
+        ]
+
+    def _split_rts(self):
+        rts = iter(self._runtimes("xxl"))
+        heads, steps, mods = {}, {}, []
+        for _, _, files in self.split_halves:
+            for fe, _ in files:
+                if fe["role"] == "dual":
+                    continue
+                rt = next(rts)
+                if fe["role"] == "mod":
+                    mods.append(rt)
+                elif fe["role"] == "head":
+                    heads[fe["layer"]] = rt
+                else:
+                    steps[fe["layer"]] = rt
+        return heads, steps, mods
+
+    def _split_slots(self, start):
+        """Cache slots s1 < s2 (one piece each, each inside one partition) for a split block placed from `start`;
+        ValueError if they do not fit."""
+        lay = CacheLayout(CONFIGS["xxl"])
+        lay.cursor = start
+        return self._place_pieces(lay) + (lay.cursor,)
+
+    def _place_pieces(self, lay):
+        s1 = lay.place(self.split_P)
+        s2 = lay.place(self.split_P)
+        return s1, s2
+
+    def _split_inputs(self, rows, rope_rows, s1, s2, mask):
+        """A split block of N rows → graph inputs (2P rows: A = first ceil(N/2) rows, B = the rest, each padded to P),
+        slot positions, and the X/Y cache masks: X holds A at s1 and B at s2, Y holds B at s1 and A at s2."""
+        P = self.split_P
+        N = rows.shape[0]
+        nA = (N + 1) // 2
+        nB = N - nA
+        x = torch.zeros(2 * P, rows.shape[-1])
+        x[:nA], x[P : P + nB] = rows[:nA].float(), rows[nA:].float()
+        rope = torch.zeros(3, 2 * P, dtype=torch.long)
+        rope[:, :nA], rope[:, P : P + nB] = rope_rows[:, :nA], rope_rows[:, nA:]
+        pos = torch.stack([s1 + torch.arange(P, dtype=torch.int32), s2 + torch.arange(P, dtype=torch.int32)])
+        mask[0, s1 : s1 + nA] = 1
+        mask[0, s2 : s2 + nB] = 1
+        mask[1, s1 : s1 + nB] = 1
+        mask[1, s2 : s2 + nA] = 1
+        return x, rope, pos, (nA, nB)
+
+    @staticmethod
+    def _dual_inputs(C, rows, rope_rows, lay, mask, valid=None):
+        """A chunk written to both caches at the same positions (both mask rows)."""
+        n = rows.shape[0]
+        start = lay.place(C)
+        x = torch.zeros(C, rows.shape[-1])
+        x[:n] = rows.float()
+        rope = torch.zeros(3, C, dtype=torch.long)
+        rope[:, :n] = rope_rows
+        mask[:, start : start + n] = 1 if valid is None else valid.float()
+        return x, rope, (start + torch.arange(C, dtype=torch.int32))[None]
+
+    def _split_mod(self, mod_rt, t):
+        """(modulation [1, 4D], output-norm scale [1, D]) of timestep t, from a half's mod graph (verified like the rest)."""
+        o = mod_rt.run(t.float().reshape(1))
+        return o[0].clone(), o[1].clone()
+
+    def _split_layer(self, li, h, mod, nscale, rope, pos, mask):
+        """Layer li of a split block: the head graph writes A/B to slot 1 of X/Y, the step graph computes the layer
+        (A and B at slot 2)."""
+        heads, steps, _ = self._split_rts()
+        bt = torch.arange(CONFIGS["xxl"].n_part, dtype=torch.int16)
+        part = CONFIGS["xxl"].part
+        bt1 = (pos[0, :1] // part).to(torch.int16)  # slot 1 lies in one partition: the head sees only that one
+        pos0 = pos[0:1] % part
+        own = torch.ones(1, CONFIGS["xxl"].part)
+        hh = self._run_group(heads[li], (h, mod, rope, pos0, bt1, own), True)
+        if li == 0:  # the layer-0 head applies img_in to the latents
+            h = hh
+        extra = [nscale] if li + 1 == self.n_layers else []
+        return self._run_group(steps[li], (h, mod, *extra, rope, pos[1:2], bt, mask), True)
+
+    def _split_chain(self, x, t, rope, pos, mask):
+        _, _, mods = self._split_rts()
+        h = x
+        for (l0, l1, _), mod_rt in zip(self.split_halves, mods, strict=True):
+            mod, nscale = self._split_mod(mod_rt, t)
+            for li in range(l0, l1):
+                h = self._split_layer(li, h, mod, nscale, rope, pos, mask)
+        return h
+
+    def _prefix_split(self, segs, enc, txt_valid, cond_lat, lay, mask):
+        """Write the prefix layer range by layer range (chunk i at layer l only needs the caches of chunks < i at layer l),
+        so that one dual model at a time is loaded next to the resident split models."""
+        import gc
+
+        import rebel
+
+        t0 = time.perf_counter()
+        chunks = []  # [kind, x, rope, pos, mask snapshot]; kind "split" for blocks above one piece
+        t_ptr = i_ptr = 0
+        for s in segs:
+            if s.kind == "tgt":
+                continue
+            if s.kind == "txt":
+                rows, valid = enc[t_ptr : t_ptr + s.length], txt_valid[t_ptr : t_ptr + s.length]
+                t_ptr += s.length
+                big = max(self._buckets("xxl", "txt"))
+                for o in range(0, s.length, big):
+                    n = min(big, s.length - o)
+                    C = self._pick("xxl", "txt", n)
+                    x, rope, pos = self._dual_inputs(
+                        C, rows[o : o + n], s.rope_rows[:, o : o + n], lay, mask, valid[o : o + n]
+                    )
+                    chunks.append(["txt", x, rope, pos, mask.clone()])
+                continue
+            rows = cond_lat[i_ptr : i_ptr + s.length]
+            i_ptr += s.length
+            if s.length <= self._small_img:
+                x, rope, pos = self._dual_inputs(self._small_img, rows, s.rope_rows, lay, mask)
+                chunks.append(["img", x, rope, pos, mask.clone()])
+            else:
+                s1, s2 = self._place_pieces(lay)
+                x, rope, pos, _ = self._split_inputs(rows, s.rope_rows, s1, s2, mask)
+                chunks.append(["split", x, rope, pos, mask.clone()])
+        _, _, mods = self._split_rts()
+        bt = torch.arange(CONFIGS["xxl"].n_part, dtype=torch.int16)
+        need = {c[0] for c in chunks} - {"split"}  # dual families this prefix needs ("txt", "img")
+        for hi, ((_, _, files), mod_rt) in enumerate(zip(self.split_halves, mods, strict=True)):
+            mod, nscale = self._split_mod(mod_rt, torch.zeros(1))  # prefix: t = 0
+            dev = self.devices[hi % len(self.devices)]
+            ranges = sorted({(fe["l0"], fe["l1"]) for fe, _ in files if fe["role"] == "dual"})
+            for a, b in ranges:
+                rts = {}
+                for fe, path in files:
+                    if fe["role"] != "dual" or (fe["l0"], fe["l1"]) != (a, b) or fe["family"] not in need:
+                        continue
+                    for free in [None, *self.on_oom]:
+                        if free is not None:
+                            free()
+                            gc.collect()
+                        if self._chiplet0_free(dev) >= self.sizes[path] + 0.2:
+                            break
+                    t1 = time.perf_counter()
+                    rts[fe["family"]] = rebel.Runtime(self._local(path), tensor_type="pt", device=dev)
+                    self.timings.setdefault("dit_prefix_load", []).append(time.perf_counter() - t1)
+                for c in chunks:
+                    kind, h, rope, pos, m = c
+                    if kind == "split":
+                        for li in range(a, b):
+                            h = self._split_layer(li, h, mod, nscale, rope, pos, m)
+                    else:
+                        h = self._run_group(rts[kind], (h, torch.zeros(KIND_TAG[kind]), mod, rope, pos, bt, m), True)
+                    c[1] = h
+                del rts
+                gc.collect()
+        self._tick("dit_prefix", t0)
+
+    def _call_one_split(self, key, hs, t, enc_all, enc_mask, layout, segs, kv_cache_mode):
+        """_call_one for xxl: same context handling (dedicated prefix regions, shared target slots after them)."""
+        st_all = self._state
+        tgt = segs[-1]
+        N = tgt.length
+        n_cond = hs.shape[0] - N
+        cond_lat, tgt_lat = hs[:n_cond], hs[n_cond:]
+        slot = layout[: enc_all.shape[0]]
+        enc = enc_all[~slot]
+        txt_valid = torch.ones(enc.shape[0], dtype=torch.bool) if enc_mask is None else enc_mask[~slot].bool()
+        C_t = 2 * self.split_P
+        ctxs = st_all["ctx"]
+        st = ctxs.get(key)
+        if st is None:
+            st = {"volatile": True, "start": 0}
+            if not st_all["all_volatile"]:
+                end = self._prefix_end("xxl", segs, st_all["cursor"], C_t)
+                if end is not None:
+                    st = {"volatile": False, "start": st_all["cursor"]}
+                    st_all["cursor"] = end
+                else:
+                    st_all["all_volatile"] = True
+            ctxs[key] = st
+        if st_all["all_volatile"]:
+            st["volatile"], st["start"] = True, 0
+        cap = CONFIGS["xxl"].cap
+        if st.get("mask") is None or kv_cache_mode is None or st["volatile"]:
+            lay = CacheLayout(CONFIGS["xxl"])
+            lay.cursor = st["start"]
+            mask = torch.zeros(2, cap)
+            self._prefix_split(segs, enc, txt_valid, cond_lat, lay, mask)
+            st["mask"], st["end"] = mask, lay.cursor
+        s1, s2, _ = self._split_slots(st["end"] if st_all["all_volatile"] else st_all["cursor"])
+        mask = st["mask"].clone()
+        x, rope, pos, (nA, nB) = self._split_inputs(tgt_lat, tgt.rope_rows, s1, s2, mask)
+        t0 = time.perf_counter()
+        out = self._split_chain(x, t.float().reshape(1), rope, pos, mask)
+        self._tick("dit_target", t0)
+        P = self.split_P
+        return torch.cat([out[:nA], out[P : P + nB]])
 
 
 def compile_unified(

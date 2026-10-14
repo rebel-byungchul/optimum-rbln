@@ -147,7 +147,7 @@ def test_vae_row_tiles_match_untiled(tiny_vae):
     )
 
 
-def _fake_dit():
+def _fake_dit(split=False):
     from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_dit import RBLNDiTKV
 
     rt = RBLNDiTKV.__new__(RBLNDiTKV)
@@ -160,6 +160,14 @@ def _fake_dit():
         "xl": [(0, 0, 32, "xp", [("txt", 512), ("img", 4352)])],
         "eager": [(0, 0, 32, "ep", [("txt", 512), ("img", 4352), ("img", 8448), ("img", 12288), ("img", 14336)])],
     }
+    if split:  # the split bank (dit_split.py): 2048-class blocks in two pieces over two caches per layer
+        from optimum.rbln.diffusers.pipelines.qwenimage21.dit_split import SPLIT_CFG, SPLIT_P
+        from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_dit import CONFIGS
+        from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_split import DUAL_EXECUTORS
+
+        CONFIGS["xxl"] = SPLIT_CFG
+        rt.split_P = SPLIT_P
+        rt.models["xxl"] = [(0, 32, None, [*DUAL_EXECUTORS, ("img", 2 * SPLIT_P), ("tgt", 2 * SPLIT_P)])]
     return rt
 
 
@@ -171,11 +179,15 @@ def _fake_dit():
         ([60], [], (128, 128), "eager"),  # 2048²
         ([30, 40], [(96, 96)], (128, 128), "eager"),  # 2048² with a 9216-token condition (output_resolution 1536)
         ([20, 5, 5, 5, 40], [(64, 64)] * 4, (158, 102), "xl"),  # 2528x1632 with 4 references
-        ([20, 5, 5, 5, 40], [(64, 64)] * 4, (128, 128), None),  # 2048² with 4 references: beyond the compiler limits
+        ([20, 5, 5, 5, 40], [(64, 64)] * 4, (128, 128), "xxl"),  # 2048² with 4 references
+        ([20] + [5] * 5 + [40], [(64, 64)] * 6, (128, 128), "xxl"),  # 2048² with 6 references
+        ([30, 40], [(128, 128)], (128, 128), "xxl"),  # 2048² with an output_resolution-2048 condition image
+        ([30, 5, 40], [(128, 128)] * 2, (128, 128), "xxl"),  # ... with two of them
+        ([30, 5, 5, 40], [(128, 128)] * 3, (128, 128), None),  # three: beyond the split cache
     ],
 )
 def test_dit_cfg_selection(text_lens, cond_grids, tgt_grid, expected):
-    rt = _fake_dit()
+    rt = _fake_dit(split=True)
     pad, shapes = _layout(text_lens, cond_grids, tgt_grid)
     segs = build_segments(pad, shapes)
     if expected is None:
@@ -183,6 +195,27 @@ def test_dit_cfg_selection(text_lens, cond_grids, tgt_grid, expected):
             rt._cfg_for(segs[-1].length, segs)
     else:
         assert rt._cfg_for(segs[-1].length, segs) == expected
+
+
+def test_split_inputs_reassemble_the_block():
+    from optimum.rbln.diffusers.pipelines.qwenimage21.dit_split import SPLIT_CFG
+
+    rt = _fake_dit(split=True)
+    N = 16385  # odd: A gets one row more than B
+    rows = torch.arange(N, dtype=torch.float32)[:, None].repeat(1, 4)
+    rope = torch.arange(N)[None].repeat(3, 1)
+    mask = torch.zeros(2, SPLIT_CFG.cap)
+    s1, s2, _ = rt._split_slots(600)
+    part = SPLIT_CFG.part
+    assert s1 // part == (s1 + rt.split_P - 1) // part and s2 // part == (s2 + rt.split_P - 1) // part and s2 > s1
+    x, r, pos, (nA, nB) = rt._split_inputs(rows, rope, s1, s2, mask)
+    P = rt.split_P
+    assert (nA, nB) == (8193, 8192)
+    assert torch.equal(torch.cat([x[:nA], x[P : P + nB]]), rows)
+    assert torch.equal(torch.cat([r[:, :nA], r[:, P : P + nB]], 1), rope)
+    # X holds A at s1 and B at s2, Y the other way round: each cache has every row once
+    assert mask[0].sum() == mask[1].sum() == N
+    assert mask[0, s1 : s1 + nA].all() and mask[1, s2 : s2 + nA].all()
 
 
 def test_dit_target_goes_after_the_prefixes():
