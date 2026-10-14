@@ -183,7 +183,8 @@ def _fake_dit(split=False):
         ([30, 40], [(128, 128)], (128, 128), "xxl"),  # 2048² with an output_resolution-2048 condition image
         ([30, 5, 40], [(128, 128)] * 2, (128, 128), "xxl"),  # ... with two of them
         ([30, 5, 5, 5, 40], [(128, 128)] * 4, (128, 128), "xxl"),  # ... with four of them
-        ([30] + [5] * 5 + [40], [(128, 128)] * 6, (128, 128), None),  # six: beyond the block cache
+        ([30] + [5] * 8 + [40], [(128, 128)] * 9, (128, 128), "xxl"),  # ... with nine of them
+        ([30] + [5] * 9 + [40], [(128, 128)] * 10, (128, 128), None),  # ten: beyond the block cache
     ],
 )
 def test_dit_cfg_selection(text_lens, cond_grids, tgt_grid, expected):

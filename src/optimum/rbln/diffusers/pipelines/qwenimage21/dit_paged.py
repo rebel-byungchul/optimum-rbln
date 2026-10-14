@@ -45,7 +45,7 @@ from .dit_kv import DiTKVShared, rope_real
 
 PIECE = 8448  # tokens per piece: a 2048-class block (≤ 16896 tokens) is two pieces
 PART = PIECE + 512  # block size: a piece and a text chunk
-BLOCKS_PER_LAYER = 12  # per layer: 2 target blocks + 10 prefix blocks (e.g. five output_resolution-2048 images + text)
+BLOCKS_PER_LAYER = 20  # per layer: 2 target blocks + 18 prefix blocks (e.g. nine output_resolution-2048 images + text)
 CHUNKS = {
     "txt64": (64, False),
     "txt512": (512, False),

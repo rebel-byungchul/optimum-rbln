@@ -34,8 +34,8 @@ VAE graphs are compiled at the exact image size the first time a size is used (2
 | Text-to-image: 1024 class, any size up to the 2048 class, all model-card presets | supported |
 | Transparent (RGBA) output and RGBA inputs | supported |
 | Single-image and local (annotated) editing at 1024 and 2048 class | supported |
-| Multi-reference editing | up to 20 references of the 1024 class, at 1024-class and 2048-class outputs (2048² and every preset) |
-| `output_resolution` up to 2048 (2048-class condition images) | up to 5 such condition images, also next to a 2048² output |
+| Multi-reference editing | up to 36 references of the 1024 class, at 1024-class and 2048-class outputs (2048² and every preset) |
+| `output_resolution` up to 2048 (2048-class condition images) | up to 9 such condition images, also next to a 2048² output |
 | True CFG with a negative prompt, `use_kv_cache=True/False` | supported |
 | Batches (several prompts, `num_images_per_prompt`) | supported (same result as the original: sample 0 equals a single run with the same seed) |
 | Odd latent patch grids (e.g. 2528x1648) | the original transformer fails with a shape error; so does this pipeline |
@@ -43,8 +43,8 @@ VAE graphs are compiled at the exact image size the first time a size is used (2
 Two compiler constraints measured on rebel-compiler 0.11.3.dev606 shape the DiT: paged flash attention is wrong across
 cache partitions for chunks of 16384 tokens or more, and the eager paged attention cache must stay below 32768 tokens.
 Requests beyond what the `flash`/`eager`/`xl` caches hold (2048-class outputs with long prefixes) run on the `xxl` DiT
-(below). Its block cache holds 10 prefix blocks of 8960 tokens per layer and context (the limits above); a longer prefix
-raises a `ValueError` that names the limit. With true CFG, a second context that does not fit next to the first is
+(below). Its block cache holds 18 prefix blocks of 8960 tokens per layer and context (the limits above, ~160k tokens of
+prefix); a longer prefix raises a `ValueError` that names the limit. With true CFG, a second context that does not fit next to the first is
 rewritten on every call (same result, slower).
 
 Measured end-to-end latency (pipeline call, 8 steps, second run of the same request, two CR13 devices; the
@@ -61,15 +61,16 @@ Measured end-to-end latency (pipeline call, 8 steps, second run of the same requ
 | Edit, model-card example (yacht sketch) | 2048² | 45.55 | 32.81 | 11.25 |
 | Edit, 4 references (xl) | 2528x1632 | 77.31 | 40.48 | 21.24 |
 | Edit, `output_resolution=1536` | 1376x1728 | 150.36 | 37.35 | 13.06 |
-| Edit, 4 / 6 references (xxl) | 2048² | 166.72 / 173.00 | 95.76 / 98.60 | 15.60 / 17.31 |
-| Edit, `output_resolution=2048` (yacht sketch, xxl) | 3456x1216 | 175.84 | 93.49 | 16.07 |
-| Edit, 2 / 3 references at `output_resolution=2048` (xxl) | 2048² | 204.49 / 238.43 | 105.10 / 112.33 | 14.28 / 15.02 |
+| Edit, 4 / 6 references (xxl) | 2048² | 181.99 / 181.99 | 102.24 / 100.97 | 22.20 / 20.67 |
+| Edit, `output_resolution=2048` (yacht sketch, xxl) | 3456x1216 | 182.89 | 93.88 | 21.36 |
+| Edit, 2 / 3 / 6 references at `output_resolution=2048` (xxl) | 2048² | 239.94 / 325.37 / 492.58 | 101.78 / 105.11 / 134.18 | 23.31 / 22.10 / 41.21 |
 
 The first request after a switch between cache configurations also loads the other DiT models (16-35 s). Requests that
 use prefix-only models load them while writing the prefix (`output_resolution=1536`: 32 one-layer models, ~50-80 s;
 4 references at 2528x1632: 4 models, ~10 s); they are copied to local disk on first use when there is room. The xxl
-DiT leaves little room for the text encoder and the large vision bucket on device 0: an xxl request with large condition
-images unloads it to encode the prompt and loads it again (~25 s, included above).
+DiT leaves little room for the text encoder and the large vision bucket on device 0: an xxl request unloads it to encode
+the prompt and loads it again, and reloads the text and vision encoders (~25-75 s with 2048-class condition images,
+included above).
 
 ## How it works
 
@@ -83,7 +84,7 @@ images unloads it to encode the prompt and loads it again (~25 s, included above
     prefix-only models loaded for the prefix phase.
   - `xl` (3 × 16384 partitions, target 16320): long prefixes; all prefix executors live in prefix-only models.
   - `xxl` (`dit_paged.py`, `runtime_paged.py`): 2048-class targets next to long prefixes. Per device, one block cache
-    for all of its layers (12 blocks of 8960 tokens per layer) and a few attention graphs without weights, shared by
+    for all of its layers (20 blocks of 8960 tokens per layer) and a few attention graphs without weights, shared by
     every layer: the block table selects the layer's blocks, so the attention's Init scratch (it grows with query chunk
     × visible cache and is allocated per graph) exists once per device. The layer computations are per-layer weight
     graphs; q/k/v and attention outputs pass through the host. A block above one piece (the target, a 2048-class
