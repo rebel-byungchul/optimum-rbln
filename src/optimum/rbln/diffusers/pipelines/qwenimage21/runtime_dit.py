@@ -14,19 +14,18 @@
 
 """Compile/load the DiT-KV graph bank, and the runtime wrapper that replaces the transformer in the diffusers pipeline.
 
-Two cache configurations, each compiled as 16-layer "unified" models (one model, several (kind, bucket) executors):
-  eager: single block 32256 — default. text 512/4096, image and target buckets 4352/8448/16896 (up to the 2048 class).
-         prefix + target ≤ 32256 (e.g. a 2048-class target with up to 3 condition images at the default output_resolution).
-  flash: partition 16384 × 5, buckets 4352 — 1024-class targets with long prefixes (up to 10 reference images).
-A request picks eager when it fits, else flash (`RBLNDiTKV._cfg_for`). Init/Intermediate scratch is allocated per executor
-and per layer, so the eager halves (77 + 89 GiB) go to two devices; switching cfg unloads the other one on OOM.
-(GRAPHS / compile_bank below are the older one-graph-per-kind bank, kept for the probes.)
+Cache configurations (CONFIGS), one resident at a time, picked per request in PREFERENCE order (`RBLNDiTKV._cfg_for`):
+  flash: 1024-class targets, long prefixes (many references)    eager: 2048-class targets (single 32256-token block)
+  xl:    targets ≤ 16320 tokens next to long prefixes           xxl:   2048-class targets next to long prefixes (runtime_paged)
+Each configuration is a few layer-group models ("unified": one compiled model with one executor per (kind, bucket)),
+spread over the devices by chiplet-0 memory; prefix chunks that do not fit next to them go through prefix-only models
+loaded for the prefix phase (PREFIX_MODELS). The timestep modulation is one small graph (dit_mod.rbln).
 
 Mapping to the original pipeline:
   kv_cache_mode="extract" (first step): write the prefix chunks to the cache and compute the target
   kv_cache_mode="cached"  (later steps): compute only the target (reuse prefix K/V)
   kv_cache_mode=None      (use_kv_cache=False): recompute from the prefix every step (same result)
-  cache_context("cond"/"uncond"): the two CFG prefixes go in different cache regions. The target region is shared (overwritten on every call).
+  cache_context("cond"/"uncond"): the two CFG prefixes go in different cache regions; the target region is shared.
 """
 
 from __future__ import annotations
@@ -35,25 +34,26 @@ import json
 import os
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
 
 import torch
 
-from .dit_kv import KIND_TAG, CacheLayout, DiTKVSegment, DiTKVShared, DiTKVUnified, KVConfig, Segment, build_segments
+from .dit_kv import KIND_TAG, CacheLayout, DiTKVShared, DiTKVUnified, DiTModulation, KVConfig, Segment, build_segments
+from .ops import split_timestep
+from .runtime_aux import chiplet0_free, run_verified
 
 
 CONFIGS = {
     "flash": KVConfig(part=16384, n_part=5, attn="flash"),
     "eager": KVConfig(part=32256, n_part=1, attn="eager"),
-    # long prefixes: the last partition holds the target. Measured 10-14: attention across partitions is exact for chunks
-    # up to 16320 tokens (also with 17408-token partitions) and wrong from 16384 tokens on (cos 0.86, whatever the
-    # partition size), so the target and image buckets stop at 16320 (e.g. 2528x1648 = 16274 tokens).
+    # long prefixes: the last partition holds the target. Attention across partitions is exact for chunks up to 16320
+    # tokens and wrong from 16384 tokens on (whatever the partition size), so the target and image buckets stop at 16320
+    # (e.g. 2528x1648 = 16274 tokens).
     "xl": KVConfig(part=16384, n_part=3, attn="flash"),
 }
 # Unified model (per-kind/bucket executors in one compiled model): cfg → (executor list [(kind, C)], layer groups [(l0, l1)])
 # flash serves the 1024 class (targets ≤ 4352 tokens, up to 10 references); eager serves larger targets (up to the 2048
 # class, prefix + target < 32768). Only one of them is resident; a request that needs the other one swaps them.
-# Device memory budget (measured 10-13/14, CR13): DRAM is split into 4 chiplets of 35 GiB and chiplet 0 receives most of the
+# Device memory budget (CR13): DRAM is split into 4 chiplets of 35 GiB and chiplet 0 receives most of the
 # Init/Intermediate scratch (eager: 22.8 GiB of Intermediate on chiplet 0 vs 7.6 on the others), so chiplet 0 is the binding
 # budget (`chiplet_gib` in the compile records). Scratch adds up over executors and layers, and storing in bf16 does not
 # shrink it (activations are already 2-byte). Hence:
@@ -79,142 +79,52 @@ PREFIX_MODELS = {
     # eager keeps its prefix executors resident; condition images above 4352 tokens go through these
     # (buckets up to 14336: with the 16896 target region and some text that is all an eager cache of 32256 holds)
     # one family per large bucket: a request loads only the executors it uses (one 1-layer model with all four buckets is
-    # 2.4 GB, so a 32-layer prefix read 77 GB: ~50 s per output_resolution-1536 request, 10-14)
+    # 2.4 GB, so a 32-layer prefix would read 77 GB per request)
     "eager": [([("txt", 512), ("img", 4352), ("img", B)], 1) for B in (8448, 12288, 14336)],
 }
-# (cfg, kind, token bucket, layers per graph)
-GRAPHS = [
-    ("flash", "txt", 512, 32),
-    ("flash", "txt", 4096, 32),
-    ("flash", "img", 4352, 32),
-    ("flash", "img", 8448, 32),
-    ("flash", "img", 16384, 16),
-    ("flash", "tgt", 4352, 32),
-    ("flash", "tgt", 8448, 32),
-    ("flash", "tgt", 16384, 16),
-    ("eager", "txt", 512, 32),
-    ("eager", "txt", 4096, 32),
-    ("eager", "img", 4352, 32),
-    ("eager", "tgt", 16896, 16),
-]
 NUM_LAYERS = 32
 HIDDEN = 4096
 LATENT_C = 64
-
-
-def graph_name(cfg, kind, C, l0, l1):
-    return f"{cfg}_{kind}_{C}_L{l0}-{l1}"
 
 
 def cache_names(cfg, layer):
     return f"{cfg}_k{layer}", f"{cfg}_v{layer}"
 
 
-def _seg_ranges(per, n=None):
-    n = n or NUM_LAYERS
-    return [(l0, min(n, l0 + per)) for l0 in range(0, n, per)]
+MOD_FILE = "dit_mod.rbln"  # DiTModulation graph (timestep → modulation), one per bank
 
 
-def compile_bank(model, out_dir: str, graphs=GRAPHS, npu="RBLN-CR13", log=print, num_layers=None):
-    """Compile all graphs in one CompileContext and save them to out_dir. model is fp32 (= NPU dlfloat)."""
-    from rebel.compile_context import CompileContext
-
-    os.makedirs(out_dir, exist_ok=True)
-    nl = num_layers or NUM_LAYERS
-    ctx = CompileContext(use_weight_sharing=True)
-    caches = {}
-    for cname, cfg in CONFIGS.items():
-        for li in range(nl):
-            for nm in cache_names(cname, li):
-                t = torch.zeros(cfg.n_part, cfg.heads, cfg.part, cfg.head_dim)
-                ctx.mark_static_address(t, nm)
-                caches[nm] = t
-    manifest = {"configs": {k: vars(v) for k, v in CONFIGS.items()}, "graphs": [], "num_layers": nl}
-    shared = DiTKVShared(model)  # all graphs in the same weight group → one copy of the weights on the device
-    done = set()
-    if os.path.exists(os.path.join(out_dir, "manifest.json")):  # resume compilation
-        with open(os.path.join(out_dir, "manifest.json")) as f:
-            manifest = json.load(f)
-        done = {(g["cfg"], g["kind"], g["C"]) for g in manifest["graphs"]}
-    for cname, kind, C, per in graphs:
-        if (cname, kind, C) in done:
-            continue
-        cfg = CONFIGS[cname]
-        while True:  # retry with fewer layers per graph
-            try:
-                entries = _compile_one(shared, ctx, caches, cfg, cname, kind, C, min(per, nl), out_dir, npu, log, nl)
-                break
-            except Exception as e:  # noqa: BLE001
-                if per <= 4:
-                    raise
-                log(f"FAILED {cname}/{kind}/{C} with {per} layers/graph: {str(e)[:80]} -> retry {per // 2}")
-                per //= 2
-        manifest["graphs"].extend(entries)
-        with open(os.path.join(out_dir, "manifest.json"), "w") as f:
-            json.dump(manifest, f, indent=2)
-    return manifest
-
-
-def _compile_one(shared, ctx, caches, cfg, cname, kind, C, per, out_dir, npu, log, nl=NUM_LAYERS):
+def compile_modulation(model, out_dir: str, npu="RBLN-CR13"):
+    """The timestep → modulation graph of the bank (skipped if present; written atomically, so concurrent jobs may race)."""
     import rebel
 
-    entries = []
-    if True:
-        for l0, l1 in _seg_ranges(per, nl):
-            name = graph_name(cname, kind, C, l0, l1)
-            path = os.path.join(out_dir, name + ".rbln")
-            seg = DiTKVSegment(shared, l0, l1, kind, l0 == 0, l1 == nl, cfg).eval()
-            x_dim = (HIDDEN if kind == "txt" else LATENT_C) if l0 == 0 else HIDDEN
-            info, ex = [("x", [C, x_dim], "float32")], [torch.zeros(C, x_dim)]
-            if kind == "tgt":
-                info.append(("timestep", [1], "float32"))
-                ex.append(torch.tensor([0.5]))
-            info += [
-                ("rope_idx", [3, C], "int64"),
-                ("cache_pos", [1, C], "int32"),
-                ("block_tables", [cfg.n_part], "int16"),
-                ("mask", [1, cfg.cap], "float32"),
-            ]
-            ex += [
-                torch.zeros(3, C, dtype=torch.long),
-                torch.arange(C, dtype=torch.int32)[None],
-                torch.arange(cfg.n_part, dtype=torch.int16),
-                torch.ones(1, cfg.cap),
-            ]
-            for li in range(l0, l1):
-                for nm in cache_names(cname, li):
-                    info.append((nm, list(caches[nm].shape), "float32"))
-                    ex.append(caches[nm])
-            t0 = time.perf_counter()
-            c = rebel.compile_from_torch(seg, input_info=info, example_inputs=ex, compile_context=ctx, npu=npu)
-            c.save(path)
-            dt = time.perf_counter() - t0
-            log(f"compiled {name} in {dt:.0f}s")
-            entries.append(
-                {"name": name, "cfg": cname, "kind": kind, "C": C, "l0": l0, "l1": l1, "compile_s": round(dt, 1)}
-            )
-    return entries
-
-
-@dataclass
-class _Placed:
-    seg: Segment
-    chunks: list = field(default_factory=list)  # [(graph C, joint start, length, cache start)]
+    path = os.path.join(out_dir, MOD_FILE)
+    if os.path.exists(path):
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    c = rebel.compile_from_torch(
+        DiTModulation(DiTKVShared(model)).eval(),
+        input_info=[("t", [3], "float32")],
+        example_inputs=[split_timestep(torch.tensor([0.5]))[0]],
+        npu=npu,
+    )
+    tmp = f"{path}.{os.getpid()}.part"
+    c.save(tmp)
+    os.replace(tmp, path)
 
 
 class RBLNDiTKV:
     """Runtime that replaces `QwenImage21Transformer2DModel`. Mimics only the attributes the pipeline uses.
 
-    bank_dir contains `{cfg}_L{l0}-{l1}.rbln` (+ .json) files built by compile_unified. One cfg = several layer-group models,
-    one model = multiple (kind, bucket) executors (selected automatically by input shape).
+    bank_dir contains `{cfg}_L{l0}-{l1}.rbln` (+ .json) files built by compile_unified (one model = several (kind, bucket)
+    executors, selected by input shape), the xxl halves (compile_paged) and the modulation graph (compile_modulation).
 
-    `device` may be a list: the layer-group models of a cfg are placed round-robin on those devices. Scratch memory (Init,
-    Intermediate) is allocated per executor and per layer and is never shared, so the 2048-class eager models (77 + 89 GiB)
-    only fit when the two 16-layer halves sit on different devices."""
+    `device` may be a list: the layer-group models of a cfg are split into contiguous runs of devices by chiplet-0 memory
+    (`_placement`). Scratch memory (Init, Intermediate) is allocated per executor and per layer and never shared."""
 
     # flash first: it covers the 1024 class (targets ≤ 4352 tokens, up to 10 references) and leaves room for the VAE. eager
     # is loaded only for larger targets. One cfg is resident at a time: a switch unloads the other one (and cached VAE graphs)
-    # before loading, since a load that fails half way does not give its device memory back (10-14).
+    # before loading, since a load that fails half way does not give its device memory back.
     # xxl (per-layer weight graphs + shared attention, runtime_paged.py) is the slowest and serves what the others cannot hold.
     PREFERENCE = ("flash", "eager", "xl", "xxl")
 
@@ -223,6 +133,12 @@ class RBLNDiTKV:
     ):
         dirs = [bank_dir] if isinstance(bank_dir, str) else list(bank_dir)
         self.bank_dir = dirs[0]
+        self.mod_path = next(
+            (os.path.join(d, MOD_FILE) for d in dirs if os.path.exists(os.path.join(d, MOD_FILE))), None
+        )
+        if self.mod_path is None:
+            raise FileNotFoundError(f"{MOD_FILE} missing in {dirs}: compile it with compile_modulation")
+        self._mod_rt, self._mods = None, {}  # modulation graph runtime; float(t) → [1, 5D] graph input
         self.models = {}  # cfg -> [(l0, l1, path, executors)]
         self.paged = None  # xxl (runtime_paged.PagedDiT)
         self.prefix_models = {}  # cfg -> [(family, l0, l1, path, executors)] (see PREFIX_MODELS)
@@ -231,9 +147,11 @@ class RBLNDiTKV:
         self.reserve = dict(
             reserve or {}
         )  # device -> chiplet-0 GiB of other components (text encoder, VAE), for _placement
+        self.prompt_lens = []  # text lengths of the request's prompts (set by the pipeline; see _cfg_for)
+        self._bucket_cache = {}
         for d in dirs:
             for f in sorted(os.listdir(d)):
-                if f.endswith(".json") and not f.startswith("manifest"):
+                if f.endswith(".json"):
                     e = json.load(open(os.path.join(d, f)))
                     if e.get("paged"):  # xxl half (runtime_paged.py)
                         self._add_paged_half(d, e)
@@ -261,31 +179,23 @@ class RBLNDiTKV:
         self.devices = list(device) if isinstance(device, list | tuple) else [device]
         if self.paged is not None:
             self.paged.devices = self.devices
-        self.device = self.devices[0]
         self.loaded = {}  # cfg -> [runtime...]
         from diffusers.configuration_utils import FrozenDict
 
         self.config = FrozenDict(config)
-        n_layers = max(m[-1][1] for m in self.models.values())
-        self.n_layers = n_layers
-        self.transformer_blocks = [None] * n_layers
+        self.transformer_blocks = [None] * max(m[-1][1] for m in self.models.values())
         self.dtype = torch.bfloat16
         self._ctx = "cond"
         self._state = {}
         self.timings: dict[str, list[float]] = {}
         self.load_s = 0.0
-        # cfgs whose model runs are verified by repetition (see _run_group): the 2048-class models. The 1024-class flash
-        # models never disagreed in 4800 layer runs and every repeated request, so they run once (add "flash" to check them)
-        self.verify = {"eager", "xl", "xxl"}
-        self.verify_stats = {}  # tag -> [verified calls, disagreements]
-        self.call_s = {}  # tag -> seconds in runtime calls
+        # cfgs whose model runs are verified by repetition (runtime_aux.run_verified): the 2048-class models. The 1024-class
+        # flash models never disagreed, so they run once (add "flash" to check them); xxl verifies its own layer graphs
+        self.verify = {"eager", "xl"}
         self.on_oom = []  # callables that free other device memory (e.g. cached VAE graphs) before a cfg switch retries
-        for (
-            cfg
-        ) in self.PREFERENCE:  # load the cfg that serves the default 1024 class (xxl only on demand: it fills the
-            if cfg in self.models and cfg != "xxl":  # devices, and the pipeline's memory hooks are not attached yet)
-                self._runtimes(cfg)
-                break
+        # load the cfg that serves the default 1024 class (xxl only on demand: it fills the devices, and the pipeline's
+        # memory hooks are not attached yet)
+        self._runtimes(next(c for c in self.PREFERENCE if c in self.models and c != "xxl"))
 
     @contextmanager
     def cache_context(self, name):
@@ -297,7 +207,7 @@ class RBLNDiTKV:
 
     def _runtimes(self, cfg):
         """Layer-group runtimes of a cfg. Only one cfg is resident: the other one is unloaded first. Room on chiplet 0 is made
-        up front (a load that fails half way does not give its memory back, 10-14), cheapest first: `on_oom` hooks."""
+        up front (a load that fails half way does not give its memory back), cheapest first: `on_oom` hooks."""
         import gc
 
         import rebel
@@ -322,8 +232,7 @@ class RBLNDiTKV:
         for free in [None, *self.on_oom]:
             if free is not None:
                 free()
-                gc.collect()
-            if all(self._chiplet0_free(d) >= n for d, n in need.items()):
+            if all(chiplet0_free(d) >= n for d, n in need.items()):
                 break
         rts = [rebel.Runtime(p, tensor_type="pt", device=dev) for p, dev in place]
         self.load_s += time.perf_counter() - t0
@@ -334,12 +243,17 @@ class RBLNDiTKV:
 
     def _local(self, path):
         """Prefix models are read on every request that needs them (a load reads the whole file, mostly Init constants):
-        keep a copy on local disk when `local_cache` is set (network storage measured 0.5-1.3 GB/s here)."""
+        keep a copy on local disk when `local_cache` is set. The copy is keyed by the source path, size and mtime (every
+        bank uses the same file names), so a recompiled or different bank never reuses an old copy."""
+        import hashlib
         import shutil
 
         if not self.local_cache:
             return path
-        dst = os.path.join(self.local_cache, os.path.basename(path))
+        src = os.path.realpath(path)
+        st = os.stat(src)
+        tag = hashlib.sha1(f"{src}|{st.st_size}|{int(st.st_mtime)}".encode()).hexdigest()[:12]
+        dst = os.path.join(self.local_cache, f"{tag}-{os.path.basename(path)}")
         if not os.path.exists(dst):
             os.makedirs(self.local_cache, exist_ok=True)
             if shutil.disk_usage(self.local_cache).free < os.path.getsize(path) + (50 << 30):
@@ -368,8 +282,6 @@ class RBLNDiTKV:
         gc.collect()
 
     def _reload_missing(self, cfg):
-        import gc
-
         import rebel
 
         t0 = time.perf_counter()
@@ -381,8 +293,7 @@ class RBLNDiTKV:
         for free in [None, *self.on_oom]:
             if free is not None:
                 free()
-                gc.collect()
-            if all(self._chiplet0_free(d) >= n for d, n in need.items()):
+            if all(chiplet0_free(d) >= n for d, n in need.items()):
                 break
         for i, (p, d, _) in enumerate(place):
             if rts[i] is None:
@@ -399,12 +310,6 @@ class RBLNDiTKV:
         if self.paged is not None:
             self.paged.rts = None  # (it holds the xxl runtimes too)
         gc.collect()
-
-    @staticmethod
-    def _chiplet0_free(device):
-        from rebel.device_info import get_device_memory_info
-
-        return get_device_memory_info(device).chiplets[0].free / 2**30
 
     def _placement(self, cfg):
         """Assign the layer groups of a cfg (in order) to contiguous runs of devices, minimizing the largest chiplet-0 load
@@ -427,8 +332,11 @@ class RBLNDiTKV:
 
     # ------------------------------------------------------------------ bucket selection
     def _buckets(self, cfg, kind):
-        execs = list(self.models[cfg][0][3]) + [x for pm in self.prefix_models.get(cfg, []) for x in pm[4]]
-        return sorted({C for k, C in execs if k == kind})
+        key = (cfg, kind)
+        if key not in self._bucket_cache:
+            execs = list(self.models[cfg][0][3]) + [x for pm in self.prefix_models.get(cfg, []) for x in pm[4]]
+            self._bucket_cache[key] = sorted({C for k, C in execs if k == kind})
+        return self._bucket_cache[key]
 
     def _pick(self, cfg, kind, n):
         for C in self._buckets(cfg, kind):
@@ -436,61 +344,56 @@ class RBLNDiTKV:
                 return C
         return None
 
-    def _run(self, cfg, kind, C, x, extra, rope, pos, mask):
+    def _modulation(self, t):
+        """[1, 5D] input of the layer graphs for timestep t (modulation | output-norm scale), one graph call per distinct t
+        (the prefix uses t = 0, like the original)."""
+        import rebel
+
+        key = float(t)
+        if key not in self._mods:
+            if self._mod_rt is None:
+                self._mod_rt = rebel.Runtime(self.mod_path, tensor_type="pt", device=self.devices[0])
+            if len(self._mods) > 64:
+                self._mods.clear()
+            mod, nscale = self._mod_rt.run(split_timestep(torch.tensor([key]))[0])
+            self._mods[key] = torch.cat([mod, nscale], dim=-1)
+        return self._mods[key]
+
+    def _run(self, cfg, kind, C, x, t, rope, pos, mask):
         l0 = self.load_s
         t_start = time.perf_counter()
         rts = self._runtimes(cfg)
-        tag = extra[0].float().reshape(1) if kind == "tgt" else torch.zeros(KIND_TAG[kind])
+        args = (torch.zeros(KIND_TAG[kind]), self._modulation(t if kind == "tgt" else 0.0), rope, pos)
         bt = torch.arange(CONFIGS[cfg].n_part, dtype=torch.int16)
         out = x
         verify = cfg in self.verify
         for rt in rts:
-            out = self._run_group(rt, (out, tag, rope, pos, bt, mask), verify)
+            out = self._run_group(rt, (out, *args, bt, mask), verify)
         self.timings.setdefault("dit_runtime_load", []).append(self.load_s - l0)
         self.timings.setdefault(f"dit_run_{kind}{C}", []).append(time.perf_counter() - t_start)
         return out
 
-    def _run_group(self, rt, args, verify, multi=False, tag=None):
-        """Run one layer-group model. With `verify`, run it until two results agree (bit for bit) and use that result.
-
-        Why (measured 10-14): models that process 2048-class chunks (16896 tokens, eager or flash attention alike) give a
-        different output for identical inputs in ~2-3 % of calls (8-layer models; errors up to half of the output range,
-        then spread by attention), on both devices. Single ops and the 1024-class models never did (4800 layer runs), so
-        it is not reproducible at op level and looks like a runtime/hardware issue. Re-running is safe: a run rewrites the
-        same cache positions with the same values."""
-
-        def raw():  # rebel.Runtime.run allocates new output tensors on every call, so results are kept without copies
-            t0 = time.perf_counter()
-            o = rt.run(*args)
-            if tag:
-                self.call_s[tag] = self.call_s.get(tag, 0.0) + time.perf_counter() - t0
-            return list(o) if isinstance(o, list | tuple) else [o]
-
-        first = raw()
-        if not verify:
-            return first if multi else first[0]
-        seen = [first]
-        while True:
-            o = raw()
-            for prev in seen:
-                if all(torch.equal(a, b) for a, b in zip(o, prev, strict=True)):
-                    if len(seen) > 1:
-                        self.timings.setdefault("dit_verify_mismatch", []).append(float(len(seen) - 1))
-                    if tag:  # per graph kind: calls and disagreements (xxl)
-                        st = self.verify_stats.setdefault(tag, [0, 0])
-                        st[0] += 1
-                        st[1] += len(seen) - 1
-                    return prev if multi else prev[0]
-            seen.append(o)
-            if len(seen) > 6:
-                raise RuntimeError("DiT model output does not repeat over 7 runs")
+    @staticmethod
+    def _run_group(rt, args, verify, multi=False):
+        """Run one layer-group model; with `verify`, until two results agree bit for bit (runtime_aux.run_verified: models
+        that process 2048-class chunks now and then give a different output for identical inputs)."""
+        o = run_verified(lambda: rt.run(*args), key="dit") if verify else rt.run(*args)
+        o = list(o) if isinstance(o, list | tuple) else [o]
+        return o if multi else o[0]
 
     def _tick(self, k, t0):
         self.timings.setdefault(k, []).append(time.perf_counter() - t0)
 
     # ------------------------------------------------------------------ prefix
-    def _cfg_for(self, n_tgt, segs, n_ctx=1):
-        """The first cfg in PREFERENCE that has a target bucket and room for the prefix next to the target region."""
+    def _cfg_for(self, n_tgt, segs):
+        """The first cfg in PREFERENCE that has a target bucket and room for the prefix next to the target region. The
+        prefix is checked with the longest prompt of the request (`prompt_lens`, e.g. a longer negative prompt), so the
+        uncond context fits too."""
+        extra = max(self.prompt_lens, default=0) - sum(s.length for s in segs if s.kind == "txt")
+        if extra > 0:
+            last_txt = max(i for i, s in enumerate(segs) if s.kind == "txt")
+            s = segs[last_txt]
+            segs = [*segs[:last_txt], Segment("txt", s.start, s.length + extra, s.rope_rows), *segs[last_txt + 1 :]]
         for cfg in self.PREFERENCE:
             if cfg not in self.models:
                 continue
@@ -541,7 +444,7 @@ class RBLNDiTKV:
         resident = set(self.models[cfg][0][3])
         if all((k, C) in resident for k, C, *_ in chunks):
             for kind, C, x, rope, pos, m in chunks:
-                self._run(cfg, kind, C, x, [], rope, pos, m)
+                self._run(cfg, kind, C, x, 0.0, rope, pos, m)
         else:
             self._prefix_layered(cfg, chunks)
         self._tick("dit_prefix", t0)
@@ -576,6 +479,7 @@ class RBLNDiTKV:
             for li in range(l0, l1):
                 dev[li] = d
         bt = torch.arange(CONFIGS[cfg].n_part, dtype=torch.int16)
+        mod0 = self._modulation(0.0)
         hs = [x for _, _, x, *_ in chunks]
         verify = cfg in self.verify
         for fam, a, _, path, _ in self.prefix_models[cfg]:
@@ -585,7 +489,7 @@ class RBLNDiTKV:
             rt = rebel.Runtime(self._local(path), tensor_type="pt", device=dev[a])
             self.timings.setdefault("dit_prefix_load", []).append(time.perf_counter() - t0)
             for i, (kind, _, _, rope, pos, m) in enumerate(chunks):
-                hs[i] = self._run_group(rt, (hs[i], torch.zeros(KIND_TAG[kind]), rope, pos, bt, m), verify)
+                hs[i] = self._run_group(rt, (hs[i], torch.zeros(KIND_TAG[kind]), mod0, rope, pos, bt, m), verify)
             del rt
             gc.collect()
 
@@ -621,7 +525,8 @@ class RBLNDiTKV:
             "extract",
         ):  # a new request starts with its cond extract call
             cfg = self._cfg_for(N, segs)
-            self._state = {"cfg": cfg, "cursor": 0, "last_prefix_end": 0, "all_volatile": False, "ctx": {}}
+            self.prompt_lens = []
+            self._state = {"cfg": cfg, "cursor": 0, "all_volatile": False, "ctx": {}}
         if not self._state:
             raise RuntimeError("the first call of a request must be the cond context with kv_cache_mode extract/None")
         ts = torch.as_tensor(timestep).reshape(-1)
@@ -640,7 +545,7 @@ class RBLNDiTKV:
                     kv_cache_mode,
                 )
             )
-        return (torch.stack(outs).to(torch.bfloat16),)
+        return (torch.stack(outs).float(),)
 
     def _tgt_start(self, cfg, C_t, prefix_end):
         """Where the target goes: right after the prefixes (attention cost grows with the position, since a chunk attends
@@ -668,6 +573,16 @@ class RBLNDiTKV:
             return None
         return end
 
+    @staticmethod
+    def _split_inputs(hs, enc_all, enc_mask, layout, N):
+        """One sample's transformer inputs → condition latents, target latents, text rows and their validity. Like the
+        original, image slot rows of encoder_hidden_states are replaced by latents, so only text rows go into txt_in."""
+        n_cond = hs.shape[0] - N
+        slot = layout[: enc_all.shape[0]]
+        enc = enc_all[~slot]
+        txt_valid = torch.ones(enc.shape[0], dtype=torch.bool) if enc_mask is None else enc_mask[~slot].bool()
+        return hs[:n_cond], hs[n_cond:], enc, txt_valid
+
     def _call_one(self, key, hs, t, enc_all, enc_mask, layout, segs, kv_cache_mode):
         st_all = self._state
         cfg = st_all["cfg"]
@@ -675,12 +590,7 @@ class RBLNDiTKV:
             return self._call_one_paged(key, hs, t, enc_all, enc_mask, layout, segs, kv_cache_mode)
         tgt = segs[-1]
         N = tgt.length
-        n_cond = hs.shape[0] - N
-        cond_lat, tgt_lat = hs[:n_cond], hs[n_cond:]
-        # original: image slot rows of encoder_hidden_states are replaced by latents, so only text rows go into txt_in
-        slot = layout[: enc_all.shape[0]]
-        enc = enc_all[~slot]
-        txt_valid = torch.ones(enc.shape[0], dtype=torch.bool) if enc_mask is None else enc_mask[~slot].bool()
+        cond_lat, tgt_lat, enc, txt_valid = self._split_inputs(hs, enc_all, enc_mask, layout, N)
         C_t = self._pick(cfg, "tgt", N)
         ctxs = st_all["ctx"]
         st = ctxs.get(key)
@@ -711,9 +621,7 @@ class RBLNDiTKV:
         rope = torch.zeros(3, C_t, dtype=torch.long)
         rope[:, :N] = tgt.rope_rows
         t0 = time.perf_counter()
-        out = self._run(
-            cfg, "tgt", C_t, x, [t.float().reshape(1)], rope, (ts_ + torch.arange(C_t, dtype=torch.int32))[None], mask
-        )
+        out = self._run(cfg, "tgt", C_t, x, t, rope, (ts_ + torch.arange(C_t, dtype=torch.int32))[None], mask)
         self._tick("dit_target", t0)
         return out[:N]
 
@@ -726,11 +634,7 @@ class RBLNDiTKV:
         for fe in e["files"]:
             self.sizes[os.path.join(d, fe["name"] + ".rbln")] = fe["chiplet_gib"][0]
         self.paged = PagedDiT(halves, [0], self._run_group)  # devices are set once known (__init__)
-        P2 = 2 * e["piece"]
-        self.models["xxl"] = [
-            (r["l0"], r["l1"], None, [("txt", 64), ("txt", 512), ("img", 4352), ("img", P2), ("tgt", P2)])
-            for r, _ in sorted(halves, key=lambda h: h[0]["l0"])
-        ]
+        self.models["xxl"] = [(r["l0"], r["l1"], None, []) for r, _ in sorted(halves, key=lambda h: h[0]["l0"])]
 
     def _call_one_paged(self, key, hs, t, enc_all, enc_mask, layout, segs, kv_cache_mode):
         """_call_one for xxl: each context gets its own block region for its prefix (rewritten from block 0 on every call
@@ -742,11 +646,7 @@ class RBLNDiTKV:
         st_all = self._state
         tgt = segs[-1]
         N = tgt.length
-        n_cond = hs.shape[0] - N
-        cond_lat, tgt_lat = hs[:n_cond], hs[n_cond:]
-        slot = layout[: enc_all.shape[0]]
-        enc = enc_all[~slot]
-        txt_valid = torch.ones(enc.shape[0], dtype=torch.bool) if enc_mask is None else enc_mask[~slot].bool()
+        cond_lat, tgt_lat, enc, txt_valid = self._split_inputs(hs, enc_all, enc_mask, layout, N)
         nbl, part, P = pg.nbl, pg.part, pg.P
         ctxs = st_all["ctx"]
         st = ctxs.get(key)
@@ -770,7 +670,7 @@ class RBLNDiTKV:
             chunks = []  # (kind, x, rope, place, [(block, offset, rows valid)])
             for kind, C, s, o in pg.chunk_plan(segs):
                 if s.kind == "txt":
-                    n = min(512, s.length - o)
+                    n = min(C, s.length - o)
                     rows = enc[t_ptr + o : t_ptr + o + n]
                     ok = txt_valid[t_ptr + o : t_ptr + o + n].float()
                     if o + n == s.length:
@@ -814,7 +714,7 @@ class RBLNDiTKV:
         valid[nbl - 1, :nB] = 1
         place = {"before": st["blocks"], "sa": (nbl - 2) * part, "sb": (nbl - 1) * part}
         t0 = time.perf_counter()
-        out = pg.run_chunk("block", x, rope, t.float().reshape(1), place, valid, target=True)
+        out = pg.run_chunk("block", x, rope, t, place, valid, target=True)
         self._tick("dit_target", t0)
         return torch.cat([out[:nA], out[P : P + nB]])
 
@@ -840,18 +740,18 @@ def compile_unified(
     npu="RBLN-CR13",
     log=print,
     num_layers=None,
-    executors=None,
 ):
     """Layers [l0, l1) of one cfg as a single compiled model with multiple (kind, bucket) executors, plus the cfg's
     PREFIX_MODELS for the same layers, all in one compile context (so they share caches and weights). Models with different
-    layer ranges share nothing, so they can be compiled concurrently in separate processes."""
+    layer ranges share nothing, so they can be compiled concurrently in separate processes. Also compiles the bank's
+    modulation graph (compile_modulation) if it is missing."""
     import rebel
     from rebel.compile_context import CompileContext
 
     nl = num_layers or NUM_LAYERS
     cfg = CONFIGS[cfg_name]
-    execs = executors or UNIFIED[cfg_name][0]
-    os.makedirs(out_dir, exist_ok=True)
+    execs = UNIFIED[cfg_name][0]
+    compile_modulation(model, out_dir, npu)
     name = f"{cfg_name}_L{l0}-{l1}"
     path = os.path.join(out_dir, name + ".rbln")
     if os.path.exists(os.path.join(out_dir, f"{name}.json")):
@@ -874,6 +774,7 @@ def compile_unified(
             info = [
                 ("x", [C, xd], "float32"),
                 ("kind_tag", [KIND_TAG[kind]], "float32"),
+                ("mod", [1, 5 * HIDDEN], "float32"),
                 ("rope_idx", [3, C], "int64"),
                 ("cache_pos", [1, C], "int32"),
                 ("block_tables", [cfg.n_part], "int16"),
@@ -881,7 +782,8 @@ def compile_unified(
             ]
             ex = [
                 torch.zeros(C, xd),
-                torch.full((KIND_TAG[kind],), 0.5),
+                torch.zeros(KIND_TAG[kind]),
+                torch.zeros(1, 5 * HIDDEN),
                 torch.zeros(3, C, dtype=torch.long),
                 torch.arange(C, dtype=torch.int32)[None],
                 torch.arange(cfg.n_part, dtype=torch.int16),

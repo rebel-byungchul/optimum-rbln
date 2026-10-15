@@ -27,18 +27,15 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.vision_utils import get_vision_interpolation_indices_and_weights, get_vision_position_ids
 
+from .ops import rotate_half
+
 
 NEG = -1e9
 
 
-def rotate_half(x):
-    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
 class GeluTanhExp(nn.Module):
-    """Same function as gelu(approximate="tanh"): 0.5x(1+tanh z) = x / (1 + exp(-2z)). On the NPU, measured over 4 blocks,
-    the error goes from 1.08 % → 0.71 % (10-13, scripts/vision_layer_probe.py)."""
+    """Same function as gelu(approximate="tanh"): 0.5x(1+tanh z) = x / (1 + exp(-2z)). On the NPU this form is more accurate
+    than the tanh kernel (over 4 vision blocks: 1.08 % → 0.71 % relative error)."""
 
     def forward(self, x):
         z = 0.7978845608028654 * (x + 0.044715 * x * x * x)
@@ -49,12 +46,13 @@ class VisionStatic(nn.Module):
     """inputs: patches [Np, C·T·P·P], interp_idx [Np, 4] int64, interp_w [Np, 4], pos [2, Np] int64, n_valid [1] int32
     outputs: merged [Np/4, 4096], deepstack [n_ds, Np/4, 4096]"""
 
-    def __init__(self, visual, max_pos: int = 1024, precise_gelu: bool = True):
+    MAX_POS = 1024  # rows of the 2D RoPE table (patch grid side)
+
+    def __init__(self, visual):
         super().__init__()
         self.v = visual
-        if precise_gelu:
-            for b in visual.blocks:
-                b.mlp.act_fn = GeluTanhExp()
+        for b in visual.blocks:
+            b.mlp.act_fn = GeluTanhExp()
         pe = visual.patch_embed
         w = pe.proj.weight  # [D, C, T, P, P]
         self.patch_lin = nn.Linear(w[0].numel(), w.shape[0], bias=True)
@@ -62,7 +60,7 @@ class VisionStatic(nn.Module):
         self.patch_lin.bias.data = pe.proj.bias.data.clone()
         rot = visual.rotary_pos_emb
         inv = rot.inv_freq.float()
-        freqs = torch.arange(max_pos, dtype=torch.float32)[:, None] * inv[None]
+        freqs = torch.arange(self.MAX_POS, dtype=torch.float32)[:, None] * inv[None]
         sc = float(rot.attention_scaling)
         self.rcos = nn.Embedding.from_pretrained(freqs.cos() * sc, freeze=True)
         self.rsin = nn.Embedding.from_pretrained(freqs.sin() * sc, freeze=True)

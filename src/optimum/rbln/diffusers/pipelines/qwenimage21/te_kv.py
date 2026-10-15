@@ -22,7 +22,7 @@ Done inside the graph:
   - token embedding gather (input_ids, int64)
   - (mm graph) replace image token positions with the vision encoder output; add deepstack features after layers 0-2
   - mRoPE: gather per-axis (t,h,w) cos/sin tables by position, then select channels by the interleaved layout (mrope_section)
-  - SiLU is ops.silu(x/(1+exp(-x))) — works around the NPU SiLU kernel precision issue (10-13)
+  - SiLU is ops.silu(x/(1+exp(-x))) — works around the NPU SiLU kernel precision issue
 The host only builds integer metadata (positions, cache positions, valid mask).
 """
 
@@ -33,7 +33,10 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from .ops import patch_silu
+from .ops import patch_silu, rotate_half
+
+
+N_DEEPSTACK = 3  # Qwen3-VL adds vision features after the first three decoder layers
 
 
 @dataclass
@@ -70,18 +73,12 @@ class MRopeGather(nn.Module):
         return torch.cat([c, c], -1), torch.cat([s, s], -1)
 
 
-def rotate_half(x):
-    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
 class TEKVShared(nn.Module):
     """Auxiliary tensors shared by the graphs (mRoPE table, scale). All graphs reference this object so they fall into the same weight group."""
 
-    def __init__(self, lm, cfg: TEConfig, precise_silu=True):
+    def __init__(self, lm, cfg: TEConfig):
         super().__init__()
-        if precise_silu:
-            patch_silu(lm)
+        patch_silu(lm)
         self.lm = lm
         self.rope = MRopeGather(lm.rotary_emb, cfg.rope_rows)
         self.scale = nn.Parameter(torch.tensor(cfg.head_dim**-0.5), requires_grad=False)
@@ -95,15 +92,13 @@ class TEKVSegment(nn.Module):
     output: hidden [C, 4096] (for the last graph, the output of the last layer, before norm)
     """
 
-    def __init__(self, shared, l0: int, l1: int, kind: str, cfg: TEConfig, n_deepstack: int = 3):
+    def __init__(self, shared: TEKVShared, l0: int, l1: int, kind: str, cfg: TEConfig):
         super().__init__()
-        if not isinstance(shared, TEKVShared):
-            shared = TEKVShared(shared, cfg)
         self.sh = shared
         self.l0, self.l1, self.kind, self.cfg = l0, l1, kind, cfg
         self.layers = list(shared.lm.layers[l0:l1])
         self.first = l0 == 0
-        self.n_ds = n_deepstack if kind == "mm" else 0
+        self.n_ds = N_DEEPSTACK if kind == "mm" else 0
 
     @property
     def lm(self):

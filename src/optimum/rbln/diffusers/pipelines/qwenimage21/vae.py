@@ -27,13 +27,13 @@ import torch.nn.functional as F
 from torch import nn
 
 
-# ops.silu (exact SiLU) gives no benefit in the VAE (10-13: PSNR 50.6→49.5 dB, latency +9 %), so the default F.silu is used.
+# ops.silu (exact SiLU) gives no benefit in the VAE (PSNR 50.6→49.5 dB against the original, 9 % slower), so the default F.silu is used.
 silu = F.silu
 
 
-# On CR13 (dev606) a single 3×3 conv fails to compile when output channels are large and resolution is high (e.g. 96→192 @512², 10-13).
+# On CR13 (dev606) a single 3×3 conv fails to compile when output channels are large and resolution is high (e.g. 96→192 @512²).
 # Splitting the output channels across several convs and concatenating works (same computation). Outputs larger than this value are split.
-# Enabling it for the decoder makes g3 fail instead (10-13), so it is enabled only while tracing the encoder graphs (_EncSplit).
+# Enabling it for the decoder makes g3 fail instead, so it is enabled only while tracing the encoder graphs (_EncSplit).
 CONV_SPLIT = {"enabled": False, "min_hw": 512 * 512, "max_out": 96}
 
 
@@ -116,7 +116,7 @@ class _DupUp2D(nn.Module):
     """2D version of DupUp3D(first_chunk).
 
     The original uses channel repeat + view/permute, so output (c, 2h+i, 2w+j) reads input channel idx[c,i,j]. idx is constant.
-    Channel gather (index_select) fails RBLN compilation at 128² and above (DEVICE_GRAPH_CONVERSION, 10-13), so
+    Channel gather (index_select) fails RBLN compilation at 128² and above (DEVICE_GRAPH_CONVERSION), so
     we check that idx has the form a*c + b + s*i (independent of j) and compute the same thing with strided slicing + repeat.
     """
 
@@ -140,7 +140,6 @@ class _DupUp2D(nn.Module):
         if s not in (0, 1) or (s == 1 and a != 2):
             raise NotImplementedError(f"DupUp channel layout a={a}, s={s} is not implemented yet")
         self.a, self.b, self.s, self.oc = a, b, s, oc
-        self.register_buffer("idx", idx.flatten(), persistent=False)  # for verification
 
     def _rows(self, x, i):
         start = self.b + self.s * i
@@ -152,13 +151,9 @@ class _DupUp2D(nn.Module):
             y = self._rows(x, 0)
             return y.repeat_interleave(2, dim=2).repeat_interleave(2, dim=3)
         # out[c, 2h+i, 2w+j] = x[b + a*c + s*i]; with s == 1, a == 2 this equals a 2x channel repeat + pixel_shuffle.
-        # (interleaving rows via stack + reshape fails to compile at 512², 10-13)
+        # (interleaving rows via stack + reshape fails to compile at 512²)
         y = x[:, self.b : self.b + self.a * self.oc]
         return F.pixel_shuffle(y.repeat_interleave(2, dim=1), 2)
-
-    def reference(self, x):
-        """Original method (gather + pixel_shuffle). For CPU verification."""
-        return F.pixel_shuffle(x.index_select(1, self.idx), 2)
 
 
 class QwenImage21VAEDecoder2D(nn.Module):
@@ -234,32 +229,6 @@ class QwenImage21VAEDecoderStage(nn.Module):
         return x.clamp(-1.0, 1.0)
 
 
-class QwenImage21VAEDecoderPart1(nn.Module):
-    """z → the two outputs (branch, shortcut) of up_blocks[-1].resnets[0].
-
-    If the residual add of the first resblock of the last up block (288→144 channels, 1024²) is inside the graph, RBLN compilation
-    fails with DEVICE_GRAPH_CONVERSION (10-13). The two terms are output separately and the add is done at the start of Part2.
-    """
-
-    def __init__(self, full: "QwenImage21VAEDecoder2D"):
-        super().__init__()
-        self.full = full
-
-    def forward(self, z):
-        f = self.full
-        dec = f.vae.decoder
-        x = QwenImage21VAEDecoderStage(f, "head")(z)
-        for k in range(len(dec.up_blocks) - 1):
-            x = QwenImage21VAEDecoderStage(f, f"up{k}")(x)
-        rb = dec.up_blocks[-1].resnets[0]
-        h = x if isinstance(rb.conv_shortcut, nn.Identity) else _conv(rb.conv_shortcut, x)
-        y = silu(_rms(rb.norm1, x))
-        y = _conv(rb.conv1, y)
-        y = silu(_rms(rb.norm2, y))
-        y = _conv(rb.conv2, y)
-        return y, h
-
-
 class QwenImage21VAEDecoderPart2(nn.Module):
     """(branch, shortcut) → add → rest of the last up block → output. The last up block has no upsampler or shortcut."""
 
@@ -279,139 +248,7 @@ class QwenImage21VAEDecoderPart2(nn.Module):
         return x.clamp(-1.0, 1.0)
 
 
-# ------------------------------------------------------------------------------------------ size buckets (masked)
-# A latent [h, w] smaller than the bucket [Hb, Wb] is placed at the top-left and the rest is zero-filled. Invariant: **outside the valid
-# region, the inputs of every conv and the attention keys are zeroed/excluded**. Then the values a conv sees at the boundary match the
-# original zero-padding, and the valid region matches decoding at the original size (padding values are discarded). RMS_norm and SiLU are per-pixel, so unaffected.
-# CR13 compile constraint (10-13): with masking, if the residual add of a channel-reducing resblock (576→288 @512², 288→144 @1024²) is
-# inside the graph, DEVICE_GRAPH_CONVERSION occurs → the graph is cut at those two blocks and (branch, shortcut) is passed on.
-
-
-def _valid_mask(hw, H, W, scale, dtype):
-    h, w = hw[0] * scale, hw[1] * scale
-    mh = (torch.arange(H, dtype=torch.int32) < h).float()
-    mw = (torch.arange(W, dtype=torch.int32) < w).float()
-    return (mh[:, None] * mw[None, :])[None, None].to(dtype)
-
-
-class _MaskedOps:
-    def __init__(self, hw):
-        self.hw = hw
-        self.cache = {}
-
-    def m(self, x, scale):
-        key = (x.shape[-2], x.shape[-1], scale, x.dtype)
-        if key not in self.cache:
-            self.cache[key] = _valid_mask(self.hw, x.shape[-2], x.shape[-1], scale, x.dtype)
-        return self.cache[key]
-
-    def conv(self, conv, x, scale):  # input mask for QwenImage21CausalConv3d (→2D)
-        return _conv(conv, x * self.m(x, scale))
-
-    def conv2d(self, conv, x, scale):  # input mask for a plain Conv2d
-        return conv(x * self.m(x, scale))
-
-    def res_parts(self, rb, x, scale):
-        h = x if isinstance(rb.conv_shortcut, nn.Identity) else self.conv(rb.conv_shortcut, x, scale)
-        y = self.conv(rb.conv1, silu(_rms(rb.norm1, x)), scale)
-        y = self.conv(rb.conv2, silu(_rms(rb.norm2, y)), scale)
-        return y, h
-
-    def resblock(self, rb, x, scale):
-        y, h = self.res_parts(rb, x, scale)
-        return y + h
-
-    def attn(self, ab, x, scale):
-        identity = x
-        B, C, H, W = x.shape
-        qkv = ab.to_qkv(_rms(ab.norm, x)).reshape(B, 1, C * 3, H * W).permute(0, 1, 3, 2)
-        q, k, v = qkv.chunk(3, dim=-1)
-        key_bias = (1 - self.m(x, scale).reshape(1, 1, 1, H * W)) * -1e9
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=key_bias)
-        o = o.squeeze(1).permute(0, 2, 1).reshape(B, C, H, W)
-        return ab.proj(o) + identity
-
-    def upblock_body(self, f, k, x, scale):
-        """All of up_blocks[k] (through the last resblock + upsample + shortcut). Returns (x, new scale)."""
-        ub, dup = f.vae.decoder.up_blocks[k], f.dup[k]
-        x_copy = x
-        for rb in ub.resnets:
-            x = self.resblock(rb, x, scale)
-        if ub.upsampler is not None:
-            scale *= 2
-            x = x.repeat_interleave(2, dim=2).repeat_interleave(2, dim=3)
-            x = self.conv2d(ub.upsampler.resample[1], x, scale)
-        if ub.avg_shortcut is not None:
-            x = x + dup(x_copy)
-        return x, scale
-
-
-class QwenImage21VAEDecoderMaskedA(nn.Module):
-    """z [1,64,Hb,Wb], hw [2] → (branch, shortcut) of the first resblock of up_blocks[3], and the input of up_blocks[3] (x_copy)."""
-
-    def __init__(self, full):
-        super().__init__()
-        self.full = full
-
-    def forward(self, z, hw):
-        f, dec = self.full, self.full.vae.decoder
-        o = _MaskedOps(hw)
-        s = 1
-        x = o.conv(f.vae.post_quant_conv, z, s)
-        x = o.conv(dec.conv_in, x, s)
-        mb = dec.mid_block
-        x = o.resblock(mb.resnets[0], x, s)
-        for ab, rb in zip(mb.attentions, mb.resnets[1:], strict=False):
-            x = o.attn(ab, x, s)
-            x = o.resblock(rb, x, s)
-        for k in range(3):
-            x, s = o.upblock_body(f, k, x, s)
-        y, h = o.res_parts(dec.up_blocks[3].resnets[0], x, s)
-        return y, h, x
-
-
-class QwenImage21VAEDecoderMaskedB(nn.Module):
-    """(branch, shortcut, x_copy, hw) → rest of up_blocks[3] + (branch, shortcut) of the first resblock of up_blocks[4]."""
-
-    def __init__(self, full):
-        super().__init__()
-        self.full = full
-
-    def forward(self, y, h, x_copy, hw):
-        f, dec = self.full, self.full.vae.decoder
-        o = _MaskedOps(hw)
-        s = 8
-        ub, dup = dec.up_blocks[3], f.dup[3]
-        x = y + h
-        for rb in ub.resnets[1:]:
-            x = o.resblock(rb, x, s)
-        s = 16
-        x = x.repeat_interleave(2, dim=2).repeat_interleave(2, dim=3)
-        x = o.conv2d(ub.upsampler.resample[1], x, s)
-        x = x + dup(x_copy)
-        return o.res_parts(dec.up_blocks[4].resnets[0], x, s)
-
-
-class QwenImage21VAEDecoderMaskedC(nn.Module):
-    """(branch, shortcut, hw) → image [1, 4, 16·Hb, 16·Wb] (only the valid region is used)."""
-
-    def __init__(self, full):
-        super().__init__()
-        self.full = full
-
-    def forward(self, y, h, hw):
-        dec = self.full.vae.decoder
-        o = _MaskedOps(hw)
-        s = 16
-        x = y + h
-        for rb in dec.up_blocks[4].resnets[1:]:
-            x = o.resblock(rb, x, s)
-        x = o.conv(dec.conv_out, silu(_rms(dec.norm_out, x)), s)
-        return x.clamp(-1.0, 1.0)
-
-
-# ------------------------------------------------------------------------------------------ exact-size chain
-# The CR13 compiler cannot handle masked buckets (10-13), so each resolution is compiled at its exact size. At large resolutions (2048-class),
+# The CR13 compiler cannot handle masked buckets, so each resolution is compiled at its exact size. At large resolutions (2048-class),
 # a single-graph decoder hits SYS_TASK_ABORTED at runtime, and compilation fails if the residual add of a channel-reducing resblock
 # (576→288 @8×, 288→144 @16×) is inside the graph → split into the 4 graphs below.
 #   g1: z → head ~ up_blocks[2]                       → x (input of up_blocks[3])
@@ -730,10 +567,10 @@ class QwenImage21VAEEncoderStage(nn.Module):
         return x[:, : e.vae.config.z_dim]
 
 
-# encoder chain: the graph is cut at the residual add of the channel-changing resblock (down_blocks[1].resnets[0], 96→192 @ H/2) (10-13).
+# encoder chain: the graph is cut at the residual add of the channel-changing resblock (down_blocks[1].resnets[0], 96→192 @ H/2).
 # Encoder chain as a program. e1..e3 (full and half resolution) have only local ops, so they can run in row tiles planned
 # in units of 16 pixel rows with a 2-unit halo (their receptive radius is about 20 pixels); e4 (low resolution, mid-block
-# attention) runs whole. Tiling is used when a size does not compile in one piece (shape-specific compiler errors, 10-14).
+# attention) runs whole. Tiling is used when a size does not compile in one piece (shape-specific compiler errors).
 ENC_TILED_STEPS = ("e1", "e2", "e3")
 ENC_TILE_HALO = 2
 ENC_TILE_UNIT = 16

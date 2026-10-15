@@ -23,7 +23,7 @@ import time
 import torch
 
 from .runtime_aux import run_verified
-from .te_kv import TEConfig, TEKVSegment, TEKVShared
+from .te_kv import N_DEEPSTACK, TEConfig, TEKVSegment, TEKVShared
 
 
 NUM_LAYERS = 36
@@ -122,17 +122,17 @@ class RBLNTextEncoderKV:
             pinned=[g["name"] for g in self.graphs if g["kind"] == "txt" and g["C"] == small["C"]],
         )
         self.timings = {}
+        self._buckets = {k: sorted({g["C"] for g in self.graphs if g["kind"] == k}) for k in ("txt", "mm")}
+        self._chains = {}  # (kind, C) → graph records in layer order
+        for g in sorted(self.graphs, key=lambda g: g["l0"]):
+            self._chains.setdefault((g["kind"], g["C"]), []).append(g)
 
     def free(self):
         """Unload the runtimes to give the device memory to the DiT; the next encode loads them again."""
         self.rt.free()
 
     def _chain(self, kind, C):
-        gs = sorted([g for g in self.graphs if g["kind"] == kind and g["C"] == C], key=lambda g: g["l0"])
-        return [(g, self.rt[g["name"]]) for g in gs]
-
-    def _buckets(self, kind):
-        return sorted({g["C"] for g in self.graphs if g["kind"] == kind})
+        return [(g, self.rt[g["name"]]) for g in self._chains[(kind, C)]]
 
     def encode(self, input_ids, position_ids, vis_rows=None, vis_mask=None, deepstack=None):
         """input_ids [L] int64, position_ids [3, L] int64 (mRoPE), vis_mask [L] bool (image token positions),
@@ -150,13 +150,13 @@ class RBLNTextEncoderKV:
             ds_full = torch.zeros(deepstack.shape[0], L, HIDDEN)
             ds_full[:, vis_mask] = deepstack.float()
         o = 0
-        big_txt, big_mm = max(self._buckets("txt")), max(self._buckets("mm"), default=0)
+        big_txt, big_mm = max(self._buckets["txt"]), max(self._buckets["mm"], default=0)
         while o < L:
             # a chunk that reaches image tokens uses the multimodal graph, otherwise the text graph
             has_vis = vis_full is not None and bool(vis_mask[o : o + big_mm].any())
             kind = "mm" if has_vis else "txt"
             n = min(big_mm if has_vis else big_txt, L - o)
-            C = next(c for c in self._buckets(kind) if c >= n)
+            C = next(c for c in self._buckets[kind] if c >= n)
             ids = torch.zeros(C, dtype=torch.long)
             ids[:n] = input_ids[o : o + n]
             pos = torch.zeros(3, C, dtype=torch.long)
@@ -173,14 +173,13 @@ class RBLNTextEncoderKV:
                     m = torch.zeros(C)
                     m[:n] = vis_mask[o : o + n].float()
                     args += [v, m]
-                if kind == "mm" and g["l0"] < 3:
+                if kind == "mm" and g["l0"] < N_DEEPSTACK:
                     d = torch.zeros(ds_full.shape[0], C, HIDDEN)
                     d[:, :n] = ds_full[:, o : o + n]
                     args.append(d)
                 h = run_verified(  # a repeat rewrites the same cache rows
                     lambda rt=rt, args=args, pos=pos, cp=cp, bt=bt, mask=mask: rt.run(*args, pos, cp, bt, mask)
                 )
-                h = h[0] if isinstance(h, list | tuple) else h
             out[o : o + n] = h[:n]
             o += n
         self.timings.setdefault("te", []).append(time.perf_counter() - t_start)

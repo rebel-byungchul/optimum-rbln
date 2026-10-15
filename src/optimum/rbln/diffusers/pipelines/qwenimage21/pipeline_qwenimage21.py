@@ -36,10 +36,13 @@ Design notes (details in the module docstrings):
   row tiles with halos (same result); each size is compiled the first time it is used and cached on disk.
 - Device memory: CR13 DRAM is split into 4 chiplets and chiplet 0 receives most scratch memory, so loads are planned
   against chiplet 0 and components free each other's memory when needed.
-- Reliability: large graphs on CR13 now and then return a different result for the same input; every graph call
-  except the 1024-class DiT is therefore run until two results agree bit for bit.
+- Reliability: large graphs on CR13 now and then return a different result for the same input; graph calls are
+  therefore run until two results agree bit for bit, except the 1024-class DiT and VAE decoder and the xxl attention
+  graphs, which never disagreed.
 - Precision: graphs are compiled from fp32 modules so the NPU computes in dlfloat16. SiLU/GELU-tanh use exp-based
-  formulas and the timestep sinusoid uses an exact table lookup, because the default kernels lose accuracy on CR13.
+  formulas because the default kernels lose accuracy on CR13. The timestep sinusoid is an exact table lookup of the fp32
+  timestep passed as three bf16 pieces (rounding the timestep to bf16 alone changes the DiT output by up to 4.5 %),
+  and the DiT returns fp32 noise predictions so the latents stay fp32 between steps, as in the fp32 original.
 """
 
 from __future__ import annotations
@@ -163,6 +166,8 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
             ]
         )
         image_pad_mask = torch.stack([torch.cat([m, m.new_zeros(L - m.shape[0])]) for m in pad_masks])
+        # text rows of each prompt: the DiT sizes its cache for the longest one of the request (e.g. the negative prompt)
+        self.transformer.prompt_lens += [int((~m).sum()) for m in pad_masks]
         return prompt_embeds, attn_mask, image_pad_mask
 
     def _encode_one(self, prompt, image):
@@ -233,6 +238,8 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
           `aux_device`: text encoder and vision encoder (default 0).
           `vae_device`: VAE (default: the last DiT device; graphs are loaded per call when memory is short).
           `vae_sizes`: list of [height, width] to precompile (other sizes compile on first use).
+          `parallel`: number of DiT layer-group models compiled at a time in subprocesses (60-100 GB RAM each; export
+            only; default: one after the other in this process). Export itself needs no NPU device.
           `local_cache`: local directory for copies of the prefix-only DiT models, which are read on every request that
             needs them (default ~/.cache/qwenimage21-rbln/prefix; None disables)."""
         rbln_config = dict(rbln_config or {})
@@ -266,7 +273,7 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
                 reserve=reserve,
                 local_cache=rbln_config.get("local_cache", os.path.expanduser("~/.cache/qwenimage21-rbln/prefix")),
             ),
-            vae=VAERuntime(d, os.path.join(d, "vae"), device=vd, enc_device=vd),
+            vae=VAERuntime(d, os.path.join(d, "vae"), device=vd),
             te_config=te_config,
             sample_sigmas=model_index.get("sample_sigmas"),
         )
@@ -301,11 +308,12 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
         t0 = time.perf_counter()
         with torch.no_grad():
             # DiT: one model with several executors per cfg (eager/flash) and layer group. Models with different layer
-            # ranges share no weights, so `parallel=True` compiles them concurrently in subprocesses (60-100 GB RAM each).
+            # ranges share no weights, so `parallel=N` compiles N of them at a time in subprocesses (60-100 GB RAM each).
             # (+ the two halves of the xxl DiT: 2048-class outputs next to long prefixes, see runtime_paged.py)
             jobs = [(c, l0, l1) for c, (_, groups) in UNIFIED.items() for l0, l1 in groups]
             jobs += [("xxl", 0, 16), ("xxl", 16, 32)]
-            if rbln_config.get("parallel", False):
+            n_par = int(rbln_config.get("parallel", 0))
+            if n_par > 1:
                 import subprocess
                 import sys
 
@@ -318,23 +326,20 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
                     "compile_paged(m, sys.argv[2], a, b, 32) if sys.argv[3] == 'xxl' else "
                     "compile_unified(m, sys.argv[2], sys.argv[3], a, b)"
                 )
-                procs = [
-                    subprocess.Popen(
-                        [
-                            sys.executable,
-                            "-c",
-                            code,
-                            snapshot,
-                            os.path.join(save_dir, "dit-unified"),
-                            c,
-                            str(l0),
-                            str(l1),
-                        ]
-                    )
-                    for c, l0, l1 in jobs
-                ]
-                if any(p.wait() for p in procs):
-                    raise RuntimeError("DiT compile failed")
+                out = os.path.join(save_dir, "dit-unified")
+                pending, running, failed = list(jobs), [], []
+                while pending or running:
+                    while pending and len(running) < n_par:
+                        c, l0, l1 = pending.pop(0)
+                        cmd = [sys.executable, "-c", code, snapshot, out, c, str(l0), str(l1)]
+                        running.append((c, l0, subprocess.Popen(cmd)))
+                    time.sleep(5)
+                    for job in [j for j in running if j[2].poll() is not None]:
+                        running.remove(job)
+                        if job[2].returncode:
+                            failed.append(f"{job[0]}_L{job[1]}")
+                if failed:
+                    raise RuntimeError(f"DiT compile failed: {failed}")
             else:
                 dit = QwenImage21Transformer2DModel.from_pretrained(
                     snapshot, subfolder="transformer", torch_dtype=torch.float32
@@ -370,7 +375,7 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
     def all_timings(self):
         from .runtime_aux import VERIFY_STATS
 
-        out = {"verify_mismatch_aux": VERIFY_STATS["mismatch"]}
+        out = {f"verify_mismatch_{k}": v for k, v in VERIFY_STATS.items()}
         for part in (self.te, self.vision, self.transformer, self.vae):
             for k, v in getattr(part, "timings", {}).items():
                 out[k] = round(sum(v), 3)
@@ -379,7 +384,8 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
     def reset_timings(self):
         from .runtime_aux import VERIFY_STATS
 
-        VERIFY_STATS["mismatch"] = 0
+        for k in VERIFY_STATS:
+            VERIFY_STATS[k] = 0
         for part in (self.te, self.vision, self.transformer, self.vae):
             part.timings = {}
 

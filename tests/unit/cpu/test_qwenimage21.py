@@ -3,6 +3,8 @@
 Skipped unless diffusers ships `QwenImage21Pipeline` (diffusers>=0.41).
 """
 
+import math
+
 import pytest
 import torch
 
@@ -24,7 +26,7 @@ from optimum.rbln.diffusers.pipelines.qwenimage21.dit_kv import (  # noqa: E402
     RopeGather,
     build_segments,
 )
-from optimum.rbln.diffusers.pipelines.qwenimage21.ops import ExactTimestepProj  # noqa: E402
+from optimum.rbln.diffusers.pipelines.qwenimage21.ops import ExactTimestepProj, split_timestep  # noqa: E402
 
 
 torch.set_grad_enabled(False)
@@ -60,12 +62,27 @@ def test_segments_and_rope_gather_match_original_rope(text_lens, cond_grids, tgt
     torch.testing.assert_close(sin[:, ::2], ref.imag.float(), rtol=0, atol=0)
 
 
-def test_exact_timestep_proj_is_bit_exact():
+def test_exact_timestep_proj_matches_fp32_original():
     g = torch.Generator().manual_seed(0)
-    t = torch.cat([torch.tensor([1.0, 0.978453, 0.414568, 0.0]), torch.rand(60, generator=g) ** 3]).to(torch.bfloat16)
-    ref = QwenImage21TemporalTimesteps(256)(t).to(torch.bfloat16)
-    out = ExactTimestepProj()(t.float())
-    assert torch.equal(out, ref)
+    t = torch.cat([torch.tensor([1.0, 0.9785, 0.84512, 0.4146, 1e-5, 0.0]), torch.rand(200, generator=g) ** 3])
+    pieces = split_timestep(t)
+    # three non-negative bf16 values that add up to t exactly (the table lookup needs both)
+    assert (pieces >= 0).all() and torch.equal(pieces.to(torch.bfloat16).float(), pieces)
+    assert torch.equal(pieces.sum(-1), t)
+    # exact sinusoid (fp64): the lookup drops pieces below 2^-23 (phase ≤ 1.2e-4 rad); the fp32 original itself rounds
+    # phases of up to 1000 rad by about as much
+    freqs = torch.exp(-math.log(10000) * torch.arange(128, dtype=torch.float32) / 128).double()
+
+    def exact(x):
+        a = 1000 * x.double()[:, None] * freqs[None]
+        return torch.cat([a.cos(), a.sin()], -1)
+
+    out = ExactTimestepProj()(pieces)
+    torch.testing.assert_close(out.double(), exact(t), rtol=0, atol=1.3e-4)
+    torch.testing.assert_close(out, QwenImage21TemporalTimesteps(256)(t), rtol=0, atol=2e-4)
+    # a bf16 timestep alone is looked up directly
+    tb = t.to(torch.bfloat16).float()
+    torch.testing.assert_close(ExactTimestepProj()(tb).double(), exact(tb), rtol=0, atol=1.3e-4)
 
 
 def test_cache_layout_keeps_flash_chunks_inside_one_partition():
@@ -96,7 +113,7 @@ def tiny_vae():
     return vae.eval()
 
 
-def test_vae_2d_decoder_and_chain_match_original(tiny_vae):
+def test_vae_2d_decoder_matches_original(tiny_vae):
     z = torch.randn(1, 8, 1, 12, 10)
     ref = tiny_vae.decode(z, return_dict=False)[0][:, :, 0]
     full = V.QwenImage21VAEDecoder2D(tiny_vae).eval()
@@ -147,10 +164,11 @@ def test_vae_row_tiles_match_untiled(tiny_vae):
     )
 
 
-def _fake_dit(split=False):
+def _fake_dit(xxl=False):
     from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_dit import RBLNDiTKV
 
     rt = RBLNDiTKV.__new__(RBLNDiTKV)
+    rt.prompt_lens, rt._bucket_cache = [], {}
     rt.models = {
         "flash": [(0, 32, "f", [("txt", 512), ("img", 4352), ("tgt", 4352)])],
         "eager": [(0, 32, "e", [("txt", 512), ("img", 4352), ("tgt", 16896)])],
@@ -160,13 +178,13 @@ def _fake_dit(split=False):
         "xl": [(0, 0, 32, "xp", [("txt", 512), ("img", 4352)])],
         "eager": [(0, 0, 32, "ep", [("txt", 512), ("img", 4352), ("img", 8448), ("img", 12288), ("img", 14336)])],
     }
-    if split:  # the xxl bank (dit_paged.py): per-layer weight graphs + shared attention over a block cache
+    if xxl:  # the xxl bank (dit_paged.py): per-layer weight graphs + shared attention over a block cache
         from optimum.rbln.diffusers.pipelines.qwenimage21.dit_paged import BLOCKS_PER_LAYER, PART, PIECE
         from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_paged import PagedDiT
 
         rec = {"l0": 0, "l1": 32, "n_layers": 32, "blocks_per_layer": BLOCKS_PER_LAYER, "part": PART, "piece": PIECE}
         rt.paged = PagedDiT([(rec, "")], [0], None)
-        rt.models["xxl"] = [(0, 32, None, [("txt", 64), ("txt", 512), ("img", 4352), ("tgt", 2 * PIECE)])]
+        rt.models["xxl"] = [(0, 32, None, [])]
     return rt
 
 
@@ -188,7 +206,7 @@ def _fake_dit(split=False):
     ],
 )
 def test_dit_cfg_selection(text_lens, cond_grids, tgt_grid, expected):
-    rt = _fake_dit(split=True)
+    rt = _fake_dit(xxl=True)
     pad, shapes = _layout(text_lens, cond_grids, tgt_grid)
     segs = build_segments(pad, shapes)
     if expected is None:
@@ -198,11 +216,21 @@ def test_dit_cfg_selection(text_lens, cond_grids, tgt_grid, expected):
         assert rt._cfg_for(segs[-1].length, segs) == expected
 
 
+def test_dit_cfg_selection_counts_the_longest_prompt():
+    # 2048² with a 9216-token condition fits the eager cache with these prompts, not with a negative prompt 3000 tokens longer
+    rt = _fake_dit(xxl=True)
+    pad, shapes = _layout([30, 40], [(96, 96)], (128, 128))
+    segs = build_segments(pad, shapes)
+    assert rt._cfg_for(segs[-1].length, segs) == "eager"
+    rt.prompt_lens = [70, 3070]
+    assert rt._cfg_for(segs[-1].length, segs) == "xxl"
+
+
 def test_xxl_pieces_and_block_orders():
     from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_dit import RBLNDiTKV
     from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_paged import BlockLayout
 
-    rt = _fake_dit(split=True)
+    rt = _fake_dit(xxl=True)
     pg = rt.paged
     P, part = pg.P, pg.part
     N = 16385  # odd: A gets one row more than B

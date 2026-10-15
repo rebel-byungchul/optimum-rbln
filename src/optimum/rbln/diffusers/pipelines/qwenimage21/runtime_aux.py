@@ -14,8 +14,9 @@
 
 """VAE decoder/encoder and vision encoder runtimes — each size is compiled on first use, saved to disk, and reused.
 
-For the VAE, masked buckets fail to compile on CR13 (10-13), so each resolution is compiled at its exact size (4-graph chain, about
-30-60 s per size). The vision encoder uses patch buckets (trailing padding + key mask), so a few buckets cover all sizes.
+The VAE cannot use masked size buckets on CR13, so each resolution is compiled at its exact size (a chain of graphs, row-tiled
+when a size does not compile in one piece). The vision encoder uses patch buckets (trailing padding + key mask), so two buckets
+cover all sizes.
 """
 
 from __future__ import annotations
@@ -33,19 +34,16 @@ import torch
 _LOCK = threading.Lock()
 
 
-def _first(x):
-    return x[0] if isinstance(x, list | tuple) else x
+VERIFY_STATS = {"aux": 0, "dit": 0}  # graph runs that disagreed with an earlier run, per component group
 
 
-VERIFY_STATS = {"mismatch": 0}  # how many repeats disagreed (all components except the DiT, which counts its own)
+def run_verified(fn, max_runs=7, key="aux"):
+    """Call `fn` until two results agree bit for bit and return that result (a single output unwrapped).
 
-
-def run_verified(fn, max_runs=7):
-    """Call `fn` until two results agree bit for bit and return that result.
-
-    Why (measured 10-14 on CR13): large graphs (2048-class DiT layer groups, 2048-class VAE graphs) now and then return a
-    different result for the same input, sometimes with values far out of range; single ops and the 1024-class graphs
-    never did. The rate varies over time, so it is checked on every call."""
+    Why (CR13, rebel-compiler dev606): large graphs (2048-class DiT layer groups, 2048-class VAE graphs) now and then return
+    a different result for the same input, sometimes with values far out of range; single ops and the 1024-class graphs
+    never did. The rate varies over time, so it is checked on every call. Re-running is safe: a graph that writes a KV
+    cache rewrites the same positions with the same values."""
 
     def as_list(o):
         return list(o) if isinstance(o, list | tuple) else [o]
@@ -57,14 +55,19 @@ def run_verified(fn, max_runs=7):
             if all(torch.equal(a, b) for a, b in zip(o, prev, strict=True)):
                 return prev if len(prev) > 1 else prev[0]
         seen.append(o)
-        VERIFY_STATS["mismatch"] += 1
+        VERIFY_STATS[key] += 1
         if len(seen) >= max_runs:
             raise RuntimeError(f"graph output does not repeat over {max_runs} runs")
 
 
 def chiplet0_free(device):
+    """Free GiB of chiplet 0 of `device` (device DRAM is partitioned per chiplet; chiplet 0 receives the graph I/O and most
+    of the scratch, so it is the binding budget on CR13). Collects garbage first so dropped runtimes are released."""
+    import gc
+
     from rebel.device_info import get_device_memory_info
 
+    gc.collect()
     return get_device_memory_info(device).chiplets[0].free / 2**30
 
 
@@ -73,8 +76,6 @@ def load_runtime(path, device, pressure=()):
     give its memory back). `pressure`: callables that free other components' memory, cheapest first. The chiplet-0
     footprint is measured on the first load and kept next to the file (compile records underestimate graphs that share
     weights: the text encoder's multimodal graph records 0.3 GiB and takes 3.7)."""
-    import gc
-
     import rebel
 
     side = path + ".chiplet0.json"
@@ -86,7 +87,6 @@ def load_runtime(path, device, pressure=()):
                     free(device, need + 0.5 - chiplet0_free(device))
                 else:
                     free()
-                gc.collect()
             if chiplet0_free(device) >= need + 0.3:
                 break
     before = chiplet0_free(device)
@@ -119,39 +119,13 @@ class _OnDemand:
             del rt
 
 
-class _LRU:
-    def __init__(self, n):
-        self.n, self.d = n, OrderedDict()
-
-    def get(self, k):
-        if k in self.d:
-            self.d.move_to_end(k)
-            return self.d[k]
-        return None
-
-    def make_room(self):
-        """Free entries so that one more fits (device memory is released before the next chain is loaded)."""
-        import gc
-
-        while self.d and len(self.d) >= self.n:
-            self.d.popitem(last=False)
-        gc.collect()
-
-    def put(self, k, v):
-        self.d[k] = v
-        self.d.move_to_end(k)
-        while len(self.d) > self.n:
-            self.d.popitem(last=False)
-
-
 class VAERuntime:
     """Drop-in replacement for diffusers AutoencoderKLQwenImage21. Runs decode/encode as NPU chains."""
 
-    def __init__(self, snapshot, cache_dir, device=0, keep=1, log=print, enc_device=None):
+    def __init__(self, snapshot, cache_dir, device=0, log=print):
         from diffusers import AutoencoderKLQwenImage21
 
         self.snapshot, self.cache_dir, self.device, self.log = snapshot, cache_dir, device, log
-        self.enc_device = device if enc_device is None else enc_device  # condition-image encoder (runs before the DiT)
         os.makedirs(cache_dir, exist_ok=True)
         cfg = json.load(open(os.path.join(snapshot, "vae", "config.json")))
         from diffusers.configuration_utils import FrozenDict
@@ -160,25 +134,23 @@ class VAERuntime:
         self.dtype = torch.bfloat16
         self._vae = None  # CPU weights are loaded only when compiling
         self.pressure = []  # callables that free other components' device memory (set by the pipeline)
-        self._dec = _LRU(keep)
-        self._enc = _LRU(keep)
+        self._dec = self._enc = None  # (size, loaded chain) of the last decoder / encoder size: one of each is kept
         self.timings = {}
         self._cls = AutoencoderKLQwenImage21
 
     def free(self):
         """Drop the cached decoder/encoder runtimes (called when the DiT needs the device memory)."""
-        self._dec, self._enc = _LRU(self._dec.n), _LRU(self._enc.n)
+        self._dec = self._enc = None
 
     def _model(self):
         if self._vae is None:
             self._vae = self._cls.from_pretrained(self.snapshot, subfolder="vae", torch_dtype=torch.bfloat16).eval()
         return self._vae
 
-    # -------------------------------------------------------------- decode
     # ---------------------------------------------------------------- chain compile (with fallbacks)
     def _candidates(self, kind, H, W):
         """(tag, program, n_tiles, tiling kwargs) to try in order. A size whose graphs do not compile in one piece is
-        tiled (row tiles are exact); shape-specific compile errors (e.g. the encoder at 1152x896, 10-14) are skipped."""
+        tiled (row tiles are exact); shape-specific compile errors (e.g. the encoder at 1152x896) are skipped."""
         from . import vae as V
 
         if kind == "dec":
@@ -256,37 +228,29 @@ class VAERuntime:
                 return d, prog, n, kw
         raise RuntimeError(f"VAE {kind} at {H}x{W}: no graph layout compiles")
 
-    def _dec_runtimes(self, H, W):
-        key = (H, W)
-        hit = self._dec.get(key)
-        if hit is not None:
-            return hit
-        d, prog, n, kw = self._chain("dec", H, W)
-        names = [nm for nm, _, _, _ in prog]
-        self._dec.make_room()
-        # next to a large resident DiT (the split one leaves ~4 GiB of chiplet 0) the largest graph of a 2048-class decoder
-        # may not fit: smaller row tiles (more of them, same result) before `pressure` unloads the DiT
-        free = self._chiplet0_free(self.device) - 0.5
-        for more in (6, 8):
-            if n >= more or max(self._chiplet0_gib([os.path.join(d, f"{nm}.rbln") for nm in names])) <= free:
+    def _fitting(self, kind, H, W, more_tiles):
+        """Load the chain of a size. Next to a large resident DiT the largest graph of a 2048-class chain may not fit on
+        chiplet 0: smaller row tiles (more of them, same result) are tried before `pressure` unloads the DiT, which would
+        then be loaded again by its next call."""
+        d, prog, n, kw = self._chain(kind, H, W)
+        free = chiplet0_free(self.device) - 0.5
+        for more in more_tiles:
+            files = [os.path.join(d, f"{nm}.rbln") for nm, _, _, _ in prog]
+            if n >= more or max(self._chiplet0_gib(files)) <= free:
                 break
             try:
-                d, prog, n, kw = self._chain("dec", H, W, min_tiles=more)
+                d, prog, n, kw = self._chain(kind, H, W, min_tiles=more)
             except RuntimeError:
                 break
+        names = [nm for nm, _, _, _ in prog]
         rts = dict(zip(names, self._load([os.path.join(d, f"{nm}.rbln") for nm in names]), strict=True))
-        hit = (rts, prog, n, kw)
-        self._dec.put(key, hit)
-        return hit
+        return rts, prog, n, kw
 
-    @staticmethod
-    def _chiplet0_free(device):
-        import gc
-
-        from rebel.device_info import get_device_memory_info
-
-        gc.collect()
-        return get_device_memory_info(device).chiplets[0].free / 2**30
+    def _dec_runtimes(self, H, W):
+        if self._dec is None or self._dec[0] != (H, W):
+            self._dec = None  # release the previous size before loading
+            self._dec = ((H, W), self._fitting("dec", H, W, (6, 8)))
+        return self._dec[1]
 
     @staticmethod
     def _chiplet0_gib(files):
@@ -307,25 +271,18 @@ class VAERuntime:
     def _load(self, files, device=None):
         """Load a chain resident if it fits in the free chiplet-0 memory (the binding budget on CR13), else load each graph only
         for its own call (2048-class sizes next to the DiT). Deciding up front avoids failed loads, which leak device memory."""
-        import gc
-
         import rebel
-        from rebel.device_info import get_device_memory_info
 
         device = self.device if device is None else device
-        gc.collect()
         need = self._chiplet0_gib(files)
-        free = get_device_memory_info(device).chiplets[0].free / 2**30 - 0.5  # margin
+        free = chiplet0_free(device) - 0.5  # margin
         if sum(need) <= free:
             return [rebel.Runtime(f, tensor_type="pt", device=device) for f in files]
-        for (
-            release
-        ) in self.pressure:  # not even the largest graph fits (e.g. 2048² next to the split DiT): free others
+        for release in self.pressure:  # not even the largest graph fits (e.g. 2048² next to the DiT): free others
             if max(need) <= free:
                 break
             release()
-            gc.collect()
-            free = get_device_memory_info(device).chiplets[0].free / 2**30 - 0.5
+            free = chiplet0_free(device) - 0.5
         if sum(need) <= free:
             return [rebel.Runtime(f, tensor_type="pt", device=device) for f in files]
         self.log(
@@ -358,15 +315,15 @@ class VAERuntime:
                 if isinstance(r, _OnDemand):
                     del live[name]
 
-        # the 1024-class decoder (coarse 4-graph chain) never disagreed with itself (0 in 1200 graph calls, 10-14): run
-        # once, like the 1024-class DiT; every other chain is verified (see run_verified)
+        # the 1024-class decoder (coarse chain) never disagreed with itself: run once, like the 1024-class DiT; every
+        # other chain is verified (see run_verified)
         verify = prog is not V.DECODER_PROGRAM_COARSE
 
         def call(nm, *a):
-            if not verify:
-                o = live[nm].run(*a)
-                return o if isinstance(o, list | tuple) else o
-            return run_verified(lambda: live[nm].run(*a))
+            if verify:
+                return run_verified(lambda: live[nm].run(*a))
+            o = live[nm].run(*a)
+            return o[0] if isinstance(o, list | tuple) and len(o) == 1 else o
 
         graphs = {nm: (lambda *a, nm=nm: call(nm, *a)) for nm in rts}
         return V.run_program(prog, graphs, start, n_tiles=n, use=use, **kw)
@@ -378,32 +335,23 @@ class VAERuntime:
         t0 = time.perf_counter()
         z4 = z[:, :, 0].to(torch.bfloat16).contiguous()
         env = self._run_chain(self._dec_runtimes(*z4.shape[-2:]), {"z": z4})
-        out = _first(env["out"])
+        out = env["out"]
         self.timings.setdefault("vae_decode", []).append(time.perf_counter() - t0)
         return (out.unsqueeze(2).float(),)
 
     # -------------------------------------------------------------- encode (condition image)
     def _enc_runtimes(self, H, W):
-        key = (H, W)
-        hit = self._enc.get(key)
-        if hit is not None:
-            return hit
-        d, prog, n, kw = self._chain("enc", H, W)
-        names = [nm for nm, _, _, _ in prog]
-        self._enc.make_room()
-        rts = dict(
-            zip(names, self._load([os.path.join(d, f"{nm}.rbln") for nm in names], self.enc_device), strict=True)
-        )
-        hit = (rts, prog, n, kw)
-        self._enc.put(key, hit)
-        return hit
+        if self._enc is None or self._enc[0] != (H, W):
+            self._enc = None  # release the previous size before loading
+            self._enc = ((H, W), self._fitting("enc", H, W, (2, 3, 4, 6)))
+        return self._enc[1]
 
     def encode(self, x, return_dict=True):
         """x [1, 4, 1, H, W] ([-1,1]) → mimics the posterior (only mode() is used)"""
         t0 = time.perf_counter()
         x4 = x[:, :, 0].to(torch.bfloat16).contiguous()
         env = self._run_chain(self._enc_runtimes(*x4.shape[-2:]), {"x": x4})
-        z = _first(env["z"]).float().unsqueeze(2)
+        z = env["z"].float().unsqueeze(2)
         self.timings.setdefault("vae_encode", []).append(time.perf_counter() - t0)
         dist = SimpleNamespace(mode=lambda: z, sample=lambda generator=None: z)
         return SimpleNamespace(latent_dist=dist)
@@ -440,7 +388,7 @@ class VisionRuntime:
         gc.collect()
 
     def visual(self):
-        """CPU module used for metadata computation (interpolation indices, weights, RoPE positions) and for compilation. Weights are needed only for compilation."""
+        """CPU vision tower, loaded only to compile a bucket (the per-image metadata comes from `self.meta`)."""
         if self._visual is None:
             from transformers import Qwen3VLForConditionalGeneration
 
@@ -452,15 +400,11 @@ class VisionRuntime:
         return self._visual
 
     def compile_bucket(self, NB):
-        return self._runtime(NB)
-
-    def _runtime(self, NB):
+        """Compile the graph of patch bucket `NB` (once, cached on disk); returns its path. Needs no NPU device."""
         import rebel
 
         from .vision import VisionStatic
 
-        if NB in self._rt:
-            return self._rt[NB]
         f = os.path.join(self.cache_dir, f"vision-{NB}.rbln")
         with _LOCK:
             if not os.path.exists(f):
@@ -477,7 +421,11 @@ class VisionRuntime:
                 ]
                 rebel.compile_from_torch(mod, input_info=info, npu="RBLN-CR13").save(f)
                 self.log(f"[vision] compiled bucket {NB} in {time.perf_counter() - t0:.0f}s")
-        self._rt[NB] = load_runtime(f, self.device, self.pressure)
+        return f
+
+    def _runtime(self, NB):
+        if NB not in self._rt:
+            self._rt[NB] = load_runtime(self.compile_bucket(NB), self.device, self.pressure)
         return self._rt[NB]
 
     def encode(self, pixel_values, image_grid_thw):
@@ -488,7 +436,11 @@ class VisionRuntime:
         merged, ds, o = [], [], 0
         for g in image_grid_thw:
             n = int(g.prod())
-            NB = next(b for b in self.BUCKETS if b >= n)
+            NB = next((b for b in self.BUCKETS if b >= n), None)
+            if NB is None:
+                raise ValueError(
+                    f"condition image of {n} patches exceeds the largest vision bucket ({self.BUCKETS[-1]})"
+                )
             I, Wt, P, nv = vision_metadata(self.meta, g[None], NB)
             pp = torch.zeros(NB, pixel_values.shape[1])
             pp[:n] = pixel_values[o : o + n].float()

@@ -30,7 +30,7 @@ import time
 
 import torch
 
-from .dit_kv import DiTKVShared, build_segments  # noqa: F401  (build_segments: used by callers through runtime_dit)
+from .dit_kv import DiTKVShared
 from .dit_paged import (
     BLOCKS_PER_LAYER,
     CHUNKS,
@@ -43,6 +43,7 @@ from .dit_paged import (
     DiTPagedPre,
     PagedAttention,
 )
+from .ops import split_timestep
 
 
 HIDDEN, LATENT_C, H, D = 4096, 64, 32, 128
@@ -61,7 +62,7 @@ def compile_paged(model, out_dir, l0, l1, n_layers, npu="RBLN-CR13", log=print, 
     nb = (l1 - l0) * blocks_per_layer
     nv = blocks_per_layer
     # no weight sharing (with it, every graph's weights land on chiplet 0); the layer graphs have one executor (all chunks
-    # padded to a block) since without sharing each executor holds its own copy of the weights (10-14)
+    # padded to a block) since without sharing each executor holds its own copy of the weights
     ctx = CompileContext(use_weight_sharing=False)
     kc = torch.zeros(nb, H, 1, PART, D)
     vc = torch.zeros(nb, H, 1, PART, D)
@@ -89,7 +90,13 @@ def compile_paged(model, out_dir, l0, l1, n_layers, npu="RBLN-CR13", log=print, 
         files.append(e)
 
     D4 = 4 * HIDDEN
-    comp(f"{name}.mod", DiTPagedMod(shared), [[("t", [1], "float32")]], [[torch.tensor([0.5])]], "mod")
+    comp(
+        f"{name}.mod",
+        DiTPagedMod(shared),
+        [[("t", [3], "float32")]],
+        [[split_timestep(torch.tensor([0.5]))[0]]],
+        "mod",
+    )
     for key, (C, bidir) in CHUNKS.items():
         info = [(n, [C, H, D], "bfloat16") for n in ("q", "k", "v")]
         info += [("seq", [1, 1], "int32"), ("bt", [nv], "int16"), ("mask", [1, nv * PART], "float32")]
@@ -206,6 +213,7 @@ class PagedDiT:
         self.P = self.halves[0][0]["piece"]
         self.n_layers = self.halves[0][0]["n_layers"]
         self.rts = None
+        self._mods = {}  # float(t) → (modulation, output-norm scale): the same for every layer and request with that t
 
     # ---------------------------------------------------------------- loading
     def placement(self):
@@ -253,9 +261,10 @@ class PagedDiT:
             if s.kind == "tgt":
                 continue
             if s.kind == "txt":
-                for o in range(0, s.length, 512):
-                    n = min(512, s.length - o)
-                    out.append(("txt64" if n <= 64 else "txt512", 64 if n <= 64 else 512, s, o))
+                T, t64 = CHUNKS["txt512"][0], CHUNKS["txt64"][0]
+                for o in range(0, s.length, T):
+                    n = min(T, s.length - o)
+                    out.append(("txt64" if n <= t64 else "txt512", t64 if n <= t64 else T, s, o))
             elif s.length <= CHUNKS["img"][0]:
                 out.append(("img", CHUNKS["img"][0], s, 0))
             elif s.length <= 2 * self.P:
@@ -281,11 +290,9 @@ class PagedDiT:
         for blocks, seq, rows in calls:
             q, k, v = (t[rows] for t in qkv)
             s, bt, mask = self._attn_args(g, layer, blocks, seq, valid)
-            # attention graphs are a single op: run once (0 disagreements in 1728 piece calls on 32 layers and 4800 single-op
-            # runs, 10-14; the disagreements come from large multi-op graphs, which stay verified)
-            outs.append(
-                self.run_group(g["attn"][key], (q, k, v, s, bt, mask), self.verify_attention, tag=f"attn_{key}")
-            )
+            # attention graphs are a single op: run once (they never disagreed with themselves; the disagreements come
+            # from large multi-op graphs, which stay verified)
+            outs.append(self.run_group(g["attn"][key], (q, k, v, s, bt, mask), self.verify_attention))
         return outs
 
     def _layer_calls(self, kind, place):
@@ -347,21 +354,20 @@ class PagedDiT:
         out = None
         H_ = None
         for g in self.rts:
-            mod, nscale = self._mod(g, t)
-            if (
-                g["l0"] == 0
-            ):  # embeddings: text rows through txt_in (512 rows per chunk), the rest packed through img_in
+            mod, nscale = self._mod(t)
+            if g["l0"] == 0:  # embeddings: text rows through txt_in (one text chunk per call), the rest through img_in
                 H_ = torch.zeros(CB, HIDDEN, dtype=torch.bfloat16)
                 qkv = [torch.zeros(CB, H, D, dtype=torch.bfloat16) for _ in range(3)]
                 img = torch.zeros(CB, LATENT_C)
                 any_img = False
                 for (a, b), (kind, x, r, _) in zip(spans, chunks, strict=True):
                     if kind.startswith("txt"):
-                        xi = torch.zeros(512, x.shape[1])
+                        T = WEIGHT_C["txt"]
+                        xi = torch.zeros(T, x.shape[1])
                         xi[: x.shape[0]] = x
-                        ri = torch.zeros(3, 512, dtype=torch.long)
+                        ri = torch.zeros(3, T, dtype=torch.long)
                         ri[:, : r.shape[1]] = r
-                        res = self.run_group(g["pre"]["txt"], (xi, mod, ri), True, multi=True, tag="pre")
+                        res = self.run_group(g["pre"]["txt"], (xi, mod, ri), True, multi=True)
                         H_[a:b] = res[0][: b - a]
                         for dst, src in zip(qkv, res[1:], strict=True):
                             dst[a:b] = src[: b - a]
@@ -369,14 +375,14 @@ class PagedDiT:
                         img[a : a + x.shape[0]] = x
                         any_img = True
                 if any_img:
-                    res = self.run_group(g["pre"]["block"], (img, mod, rope), True, multi=True, tag="pre")
+                    res = self.run_group(g["pre"]["block"], (img, mod, rope), True, multi=True)
                     for (a, b), (kind, *_) in zip(spans, chunks, strict=True):
                         if not kind.startswith("txt"):
                             H_[a:b] = res[0][a:b]
                             for dst, src in zip(qkv, res[1:], strict=True):
                                 dst[a:b] = src[a:b]
             else:
-                H_, *qkv = self.run_group(g["pre"]["block"], (H_, mod, rope), True, multi=True, tag="pre")
+                H_, *qkv = self.run_group(g["pre"]["block"], (H_, mod, rope), True, multi=True)
             for li in range(g["l0"], g["l1"]):
                 if len(chunks) == 1 and spans[0] == (0, CB):  # one block: its attention output is the whole row block
                     key, calls, assemble = plans[0]
@@ -388,17 +394,18 @@ class PagedDiT:
                         o[a:b] = assemble(self._attend(g, li, key, part_qkv, calls, valid))
                 if li + 1 == self.n_layers:
                     if target:
-                        out = self.run_group(g["post"][li], (H_, o, mod, nscale), True, tag="post")
+                        out = self.run_group(g["post"][li], (H_, o, mod, nscale), True)
                     break
-                res = self.run_group(g["mid"][li], (H_, o, mod, rope), True, multi=True, tag="mid")
+                res = self.run_group(g["mid"][li], (H_, o, mod, rope), True, multi=True)
                 H_, qkv = res[0], res[1:]
         return out
 
-    def _mod(self, g, t):
-        key = (id(g), float(t))
-        cache = getattr(self, "_mods", {})
-        if key not in cache:
-            o = g["mod"].run(t.float().reshape(1))
-            cache[key] = (o[0].clone(), o[1].clone())
-            self._mods = cache
-        return cache[key]
+    def _mod(self, t):
+        """Modulation inputs of the layer graphs for timestep t (one small graph call per distinct t)."""
+        key = float(t)
+        if key not in self._mods:
+            if len(self._mods) > 64:
+                self._mods.clear()
+            o = self.rts[0]["mod"].run(split_timestep(t.reshape(1))[0])
+            self._mods[key] = (o[0], o[1])
+        return self._mods[key]

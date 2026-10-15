@@ -14,7 +14,7 @@
 
 """Qwen-Image-2.1 DiT for 2048-class outputs next to long prefixes ("xxl"): per-layer weight graphs + shared attention.
 
-Why (CR13, rebel-compiler dev606, measured 10-14):
+Why (CR13, rebel-compiler dev606):
 - paged flash attention is wrong across partitions for chunks of 16384 tokens or more, and the eager cache must stay below
   32768 tokens, so a 2048² target (16384 tokens) or an output_resolution-2048 condition image next to a long prefix fits
   neither the flash nor the eager configuration;
@@ -40,7 +40,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from .dit_kv import DiTKVShared, rope_real
+from .dit_kv import DiTKVShared, DiTModulation, rope_real
 
 
 PIECE = 8448  # tokens per piece: a 2048-class block (≤ 16896 tokens) is two pieces
@@ -112,13 +112,9 @@ class _LayerBase(nn.Module):
         return tuple(t[0].to(torch.bfloat16) for t in (q, k, v))  # [C, H, D]
 
 
-class DiTPagedMod(_LayerBase):
-    """Timestep → modulation [1, 4D] and output-norm scale [1, D] (inputs of the layer graphs)."""
-
-    def forward(self, t):
-        m = self.m
-        temb = m.time_text_embed.timestep_embedder(self.sh.tproj(t).to(t.dtype))
-        return m.modulation(temb), m.norm_out.linear(m.norm_out.silu(temb))
+DiTPagedMod = (
+    DiTModulation  # timestep pieces [3] → modulation [1, 4D], output-norm scale [1, D] (inputs of the layer graphs)
+)
 
 
 class DiTPagedPre(_LayerBase):
