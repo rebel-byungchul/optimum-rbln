@@ -304,8 +304,9 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
 
         make_room.takes_need = True
         pipe.te.rt.pressure = pipe.vision.pressure = [pipe.vae.free, make_room, pipe.transformer.release]
-        # and the VAE, when even one of its graphs does not fit (2048-class decode next to the xxl DiT): the DiT
-        pipe.vae.pressure = [pipe.transformer.release]
+        # and the VAE, when even one of its graphs does not fit: its other cached chain, then the DiT
+        pipe.vae.pressure = [pipe.vae.free, pipe.transformer.release]
+        pipe.vae.dit_cfg = lambda: pipe.transformer._state.get("cfg")
         return pipe
 
     @classmethod

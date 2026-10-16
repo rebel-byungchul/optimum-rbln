@@ -146,7 +146,6 @@ class _DupUp2D(nn.Module):
         return x[:, start : start + self.a * (self.oc - 1) + 1 : self.a]  # [B, oc, H, W]
 
     def forward(self, x):
-        B, _, H, W = x.shape
         if self.s == 0:
             y = self._rows(x, 0)
             return y.repeat_interleave(2, dim=2).repeat_interleave(2, dim=3)

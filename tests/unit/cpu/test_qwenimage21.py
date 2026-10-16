@@ -4,6 +4,7 @@ Skipped unless diffusers ships `QwenImage21Pipeline` (diffusers>=0.41).
 """
 
 import math
+import os
 
 import pytest
 import torch
@@ -322,3 +323,24 @@ def test_xxl_layer_call_disagreement_falls_back_and_deferred_check_recomputes():
     assert fixed is not None
     torch.testing.assert_close(fixed[0], 2 * x)
     assert pg._settle(None) is None  # nothing pending any more
+
+
+@pytest.mark.parametrize("dit_cfg, kind, expected", [("eager", "dec", 4), ("xxl", "dec", 8), ("eager", "enc", 2)])
+def test_vae_tile_count_depends_on_the_request_only(monkeypatch, dit_cfg, kind, expected):
+    # chains with other tile heights round differently, so the free memory at the call must not pick the tile count
+    from optimum.rbln.diffusers.pipelines.qwenimage21 import runtime_aux as A
+
+    largest = {"dec": {4: 5.2, 6: 4.0, 8: 3.4}, "enc": {1: 4.3, 2: 2.7, 3: 1.6}}[kind]  # chiplet-0 GiB (2048² sizes)
+    prog = V.DECODER_PROGRAM if kind == "dec" else V.ENCODER_PROGRAM
+    vae = object.__new__(A.VAERuntime)
+    vae.dit_cfg = lambda: dit_cfg
+    vae._chain = lambda k, H, W, min_tiles=1: (
+        f"t{min(n for n in largest if n >= min_tiles)}",
+        prog,
+        min(n for n in largest if n >= min_tiles),
+        {},
+    )
+    vae._chiplet0_gib = lambda files: [largest[int(os.path.basename(os.path.dirname(files[0]))[1:])]]
+    vae._load = lambda files: [None] * len(files)
+    monkeypatch.setattr(A, "chiplet0_free", lambda device: pytest.fail("the tile count must not read the free memory"))
+    assert vae._fitting(kind, 128, 128, (6, 8) if kind == "dec" else (2, 3, 4, 6))[2] == expected

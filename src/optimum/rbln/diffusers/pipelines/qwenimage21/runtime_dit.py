@@ -223,6 +223,7 @@ class RBLNDiTKV:
             self.loaded.clear()
             if self.paged is not None:
                 self.paged.rts = None
+                self.paged.free_buffers()  # (a switch away from xxl: its host buffers are not needed)
             gc.collect()
         place = [(p, d) for p, d, _ in self.paged.placement()] if cfg == "xxl" else self._placement(cfg)
         need = {}

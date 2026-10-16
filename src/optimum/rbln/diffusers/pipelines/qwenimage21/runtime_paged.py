@@ -15,7 +15,7 @@
 """Compile/run the "xxl" DiT (dit_paged.py): per-layer weight graphs + shared attention graphs over a block cache.
 
 Bank layout: one compile context per layer half (the halves sit on different devices). Per half, in load order:
-  mod                 timestep → modulation, output-norm scale
+  mod                 timestep → modulation, output-norm scale (first half only: one serves every layer)
   attn_{txt64,txt512,img,piece}   attention over the half's block cache (no weights, shared by every layer)
   pre{l0}_{block,txt} q/k/v of the half's first layer (a block of rows; layer 0 also 512 text rows through txt_in)
   mid{l}              rest of layer l + q/k/v of layer l+1 (the half's last layer: hidden state only)
@@ -108,13 +108,14 @@ def compile_paged(
         files.append(e)
 
     D4 = 4 * HIDDEN
-    comp(
-        f"{name}.mod",
-        DiTPagedMod(shared),
-        [[("t", [3], "float32")]],
-        [[split_timestep(torch.tensor([0.5]))[0]]],
-        "mod",
-    )
+    if l0 == 0:  # one modulation graph serves both halves
+        comp(
+            f"{name}.mod",
+            DiTPagedMod(shared),
+            [[("t", [3], "float32")]],
+            [[split_timestep(torch.tensor([0.5]))[0]]],
+            "mod",
+        )
     for key, (C, bidir) in CHUNKS.items():
         info = [(n, [C, H, D], aio) for n in ("q", "k", "v")]
         info += [("seq", [1, 1], "int32"), ("bt", [nv], "int16"), ("mask", [1, nv * PART], "float32")]
@@ -287,8 +288,9 @@ class PagedDiT:
             self.rts.append(g)
 
     def free_buffers(self):
-        """Drop the host-side output buffers (~2.5 GB) when the xxl graphs are unloaded."""
+        """Drop the host-side output buffers (~3 GB) when the xxl graphs are unloaded."""
         self._bufs, self._abufs, self._obufs = {}, {}, {}
+        self._pending = None
 
     # ---------------------------------------------------------------- layout
     def capacity_check(self, segs, n_tgt):
@@ -403,6 +405,7 @@ class PagedDiT:
         computes all their rows. valid [blocks, part]: cache positions they may see. Returns the target's noise
         prediction (target=True: a single split block)."""
         CB = 2 * self.P
+        self._pending = None  # (a request interrupted by an error must not leave a deferred check behind)
         self._masks = {}  # (valid, block order) → attention mask, for this group's calls (`valid` stays the same)
         spans, o0 = [], 0  # rows of each chunk in the packed block
         for kind, *_ in chunks:
@@ -421,7 +424,7 @@ class PagedDiT:
             if g["l0"] == 0 and single:  # embeddings of a single block: the pre graph's outputs as they are
                 img = torch.zeros(CB, LATENT_C)
                 img[: chunks[0][1].shape[0]] = chunks[0][1]
-                H_, *qkv = self._layer(g["pre"]["block"], (img, mod, rope))
+                H_, *qkv = self._layer(g["pre"]["block"], (img, mod, rope), defer=True)
             elif (
                 g["l0"] == 0
             ):  # embeddings: text rows through txt_in (one text chunk per call), the rest through img_in
@@ -452,7 +455,7 @@ class PagedDiT:
                                 dst[a:b] = src[a:b]
             else:
                 H_ = self._settle(H_)  # (the last layer of the previous half)
-                H_, *qkv = self._layer(g["pre"]["block"], (H_, mod, rope))
+                H_, *qkv = self._layer(g["pre"]["block"], (H_, mod, rope), defer=True)
             li = g["l0"]
             while li < g["l1"]:
                 o = self._obufs.get(li % 2)  # the layer's attention-output block (two, alternating by layer)
@@ -462,7 +465,7 @@ class PagedDiT:
                     key, calls, _ = plans[0]
                     self._attend(g, li, key, qkv, calls, valid, dest=[None, o[self.P :], o[: self.P]])
                 else:
-                    o.zero_()
+                    o[spans[-1][1] :].zero_()  # rows after the last chunk (the chunks write all of theirs)
                     for (a, b), (key, calls, assemble) in zip(spans, plans, strict=True):
                         part_qkv = [t_[a:b] for t_ in qkv]
                         o[a:b] = assemble(self._attend(g, li, key, part_qkv, calls, valid))
@@ -480,8 +483,6 @@ class PagedDiT:
                 res = self._layer(g["mid"][li], (H_, o, mod, rope), defer=True)
                 H_, qkv = res[0], res[1:]
                 li += 1
-        if self._pending is not None:  # a prefix group's last layer graph
-            self._settle(None)
         return out
 
     def _settle(self, H_):
@@ -504,19 +505,13 @@ class PagedDiT:
         sets that do not hold this call's inputs receive the two runs; if they differ, the call is repeated through
         `run_group` (fresh outputs, run until two agree). defer: the comparison runs in a background thread while the
         next layer's attention calls run, and _settle checks it before the outputs feed another layer graph."""
-        sets = None
-        sig = self._sigs.get(id(rt))
-        if sig is not None:
-            used = {a.data_ptr() for a in args}
-            pool = self._bufs.setdefault(sig, [])
-            sets = [b for b in pool if b[0].data_ptr() not in used][:2]
-            while len(sets) < 2:  # three sets cover a chain of calls (inputs from one set, outputs into the other two)
-                pool.append([torch.empty(shape, dtype=dt) for shape, dt in sig])
-                sets.append(pool[-1])
-        if sets is None:  # first call of this graph: learn its outputs
-            res = self.run_group(rt, args, True, multi=True)
-            self._sigs[id(rt)] = tuple((tuple(r.shape), r.dtype) for r in res)
-            return res
+        sig = self._sigs[id(rt)]  # output layout (bind)
+        used = {a.data_ptr() for a in args}
+        pool = self._bufs.setdefault(sig, [])
+        sets = [b for b in pool if b[0].data_ptr() not in used][:2]
+        while len(sets) < 2:  # three sets cover a chain of calls (inputs from one set, outputs into the other two)
+            pool.append([torch.empty(shape, dtype=dt) for shape, dt in sig])
+            sets.append(pool[-1])
         a, b = sets
         rt.run(*args, out=a)
         rt.run(*args, out=b)

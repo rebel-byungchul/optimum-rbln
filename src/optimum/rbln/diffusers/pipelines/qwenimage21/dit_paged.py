@@ -57,7 +57,7 @@ WEIGHT_C = {"txt": 512, "block": 2 * PIECE}  # rows of the layer graphs (txt: la
 
 
 class PagedAttention(nn.Module):
-    """Paged flash attention over the block cache, no weights. q, k, v [C, H, D] bf16 → o [C, H, D] bf16.
+    """Paged flash attention over the block cache, no weights. q, k, v [C, H, D] → o [C, H, D] (attn_dtype).
     seq [1, 1]: logical position of the chunk; bt [nv]: physical blocks in logical order; mask [1, nv × part]."""
 
     def __init__(self, C, bidir, part, heads=32, head_dim=128, attn_dtype=torch.bfloat16):

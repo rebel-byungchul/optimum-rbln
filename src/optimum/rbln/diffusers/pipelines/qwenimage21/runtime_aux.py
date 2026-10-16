@@ -134,6 +134,7 @@ class VAERuntime:
         self.dtype = torch.bfloat16
         self._vae = None  # CPU weights are loaded only when compiling
         self.pressure = []  # callables that free other components' device memory (set by the pipeline)
+        self.dit_cfg = lambda: None  # DiT configuration of the current request (set by the pipeline; see TILE_GIB)
         self._dec = self._enc = None  # (size, loaded chain) of the last decoder / encoder size: one of each is kept
         self.timings = {}
         self._cls = AutoencoderKLQwenImage21
@@ -233,15 +234,25 @@ class VAERuntime:
                 return d, prog, n, kw
         raise RuntimeError(f"VAE {kind} at {H}x{W}: no graph layout compiles")
 
+    # Largest graph of a tiled chain: what chiplet 0 has free next to the request's DiT configuration less a margin
+    # (4.2 GiB next to the xxl DiT, 12.3 next to eager). The encoder runs before the DiT picks its configuration, so it
+    # takes the xxl budget.
+    TILE_GIB = {"xxl": 3.6, "other": 7.5}
+
     def _fitting(self, kind, H, W, more_tiles):
         """Load the chain of a size. Next to a large resident DiT the largest graph of a 2048-class chain may not fit on
-        chiplet 0: smaller row tiles (more of them, same result) are tried before `pressure` unloads the DiT, which would
-        then be loaded again by its next call."""
+        chiplet 0, so a tiled chain takes more row tiles until its largest graph is within TILE_GIB, rather than have
+        `pressure` unload the DiT (loaded again by its next call). The tile count depends on the request (size, DiT
+        configuration), not on what is resident at the call: chains with other tile heights compile to slightly
+        different roundings (0.3-0.5 %, as close to the fp32 original), so a seed would otherwise give a different image
+        from one request to the next."""
+        from . import vae as V
+
+        gib = self.TILE_GIB["xxl" if kind == "enc" or self.dit_cfg() == "xxl" else "other"]
         d, prog, n, kw = self._chain(kind, H, W)
-        free = chiplet0_free(self.device) - 0.5
-        for more in more_tiles:
+        for more in more_tiles if prog is not V.DECODER_PROGRAM_COARSE else ():
             files = [os.path.join(d, f"{nm}.rbln") for nm, _, _, _ in prog]
-            if n >= more or max(self._chiplet0_gib(files)) <= free:
+            if n >= more or max(self._chiplet0_gib(files)) <= gib:
                 break
             try:
                 d, prog, n, kw = self._chain(kind, H, W, min_tiles=more)
@@ -286,6 +297,9 @@ class VAERuntime:
         for release in self.pressure:  # not even the largest graph fits (e.g. 2048² next to the DiT): free others
             if max(need) <= free:
                 break
+            self.log(
+                f"[vae] {os.path.basename(os.path.dirname(files[0]))}: {free:.1f} GiB free, releasing {release.__qualname__}"
+            )
             release()
             free = chiplet0_free(device) - 0.5
         if sum(need) <= free:
