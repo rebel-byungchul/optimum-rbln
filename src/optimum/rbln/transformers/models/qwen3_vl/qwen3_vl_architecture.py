@@ -468,3 +468,59 @@ class Qwen3VLAttention(DecoderOnlyAttention):
         if hasattr(self_attn, "config") and hasattr(self_attn.config, "head_dim"):
             return self_attn.config.head_dim**-0.5
         return self_attn.head_dim**-0.5
+
+
+class _ExpSiLU(nn.Module):
+    """SiLU written as `x / (1 + exp(-x))`.
+
+    On RBLN-CR13 (rebel-compiler 0.12.1.dev163) the fused SiLU kernel that `F.silu` and `x * sigmoid(x)` both lower to
+    loses precision on the gate activations of the Qwen3-VL text MLPs (1.4 % relative error on `silu(gate) * up` in
+    layer 2, against 0.36 % for CPU bf16), and the error compounds over the layers. The exp form is lowered differently
+    and stays at 0.1 %.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x / (1 + torch.exp(-x))
+
+
+class Qwen3VLTextEncoderWrapper(nn.Module):
+    """The Qwen3-VL text tower as a single-pass prompt encoder graph.
+
+    It runs the decoder layers with a causal mask restricted to the valid (attention mask 1) keys, like the Hugging
+    Face model does with an attention mask, so the padding positions are computed too. The rotary embeddings come in
+    as inputs, computed on the host from the position ids. The output is the requested `hidden_states` entries
+    concatenated along the hidden dimension; layers past the last requested one are not part of the graph.
+    """
+
+    def __init__(self, model: PreTrainedModel, hidden_states_layers: list[int]) -> None:
+        super().__init__()
+        language_model = model.model.language_model
+        self.embed_tokens = language_model.embed_tokens
+        self.layers = language_model.layers[: max(hidden_states_layers)]
+        for layer in self.layers:
+            layer.mlp.act_fn = _ExpSiLU()
+        self.norm = language_model.norm
+        self.num_hidden_layers = len(language_model.layers)
+        self.hidden_states_layers = hidden_states_layers
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_cos: torch.Tensor,
+        position_sin: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states = self.embed_tokens(input_ids)
+        seq_len = input_ids.shape[1]
+        causal = torch.tril(torch.ones(seq_len, seq_len, dtype=attention_mask.dtype))
+        allowed = causal[None, None, :, :] * attention_mask[:, None, None, :]
+        mask = (allowed - 1) * torch.finfo(allowed.dtype).max
+        position_embeddings = (position_cos, position_sin)
+
+        outputs = [hidden_states] if 0 in self.hidden_states_layers else []
+        for layer_idx, layer in enumerate(self.layers, start=1):
+            hidden_states = layer(hidden_states, position_embeddings=position_embeddings, attention_mask=mask)
+            if layer_idx in self.hidden_states_layers:
+                # The last entry of the Hugging Face `hidden_states` is taken after the final norm.
+                outputs.append(self.norm(hidden_states) if layer_idx == self.num_hidden_layers else hidden_states)
+        return torch.cat(outputs, dim=-1)

@@ -23,8 +23,10 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
     Qwen3VLConfig,
+    Qwen3VLForConditionalGeneration,
 )
 from transformers.initialization import no_init_weights
+from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLModel,
     Qwen3VLTextRotaryEmbedding,
@@ -45,9 +47,10 @@ from ..decoderonly.decoderonly_runtime_utils import RBLNPageTableManager, RBLNRu
 from ..decoderonly.modeling_decoderonly import RBLNDecoderOnlyModel, RBLNDecoderOnlyModelForCausalLM
 from .configuration_qwen3_vl import (
     RBLNQwen3VLForConditionalGenerationConfig,
+    RBLNQwen3VLTextEncoderConfig,
     RBLNQwen3VLVisionModelConfig,
 )
-from .qwen3_vl_architecture import Qwen3VL_LanguageModelWrapper, Qwen3VLVisionModelWrapper
+from .qwen3_vl_architecture import Qwen3VL_LanguageModelWrapper, Qwen3VLTextEncoderWrapper, Qwen3VLVisionModelWrapper
 from .qwen3_vl_runtime_utils import RBLNQwen3VLRuntimeModel
 
 
@@ -985,8 +988,126 @@ class RBLNQwen3VLForConditionalGeneration(RBLNQwenVLBatchSortMixin, RBLNQwen3VLM
             )
 
 
+class RBLNQwen3VLTextEncoder(RBLNModel):
+    """
+    The text tower of a Qwen3-VL checkpoint as a single-pass prompt encoder on RBLN devices.
+
+    Text-to-image pipelines such as FLUX.3 call a `Qwen3VLForConditionalGeneration` once per prompt with
+    `output_hidden_states=True` and read a few intermediate layers, including at the padding positions. This class
+    compiles exactly that: one graph without a KV cache that runs the decoder layers over the whole padded prompt
+    (causal attention over the valid tokens, as with the Hugging Face attention mask) and returns the requested
+    `hidden_states` entries. It is a drop-in replacement for that call; it does not generate.
+
+    This class inherits from [`RBLNModel`]. Check the superclass documentation for the generic methods
+    the library implements for all its models.
+    """
+
+    _hf_class = Qwen3VLForConditionalGeneration
+    _rbln_config_class = RBLNQwen3VLTextEncoderConfig
+
+    def __post_init__(self, **kwargs):
+        super().__post_init__(**kwargs)
+        self.rotary_emb = Qwen3VLTextRotaryEmbedding(self.config.text_config)
+
+    @classmethod
+    def _wrap_model_if_needed(cls, model: "PreTrainedModel", rbln_config: RBLNQwen3VLTextEncoderConfig):
+        return Qwen3VLTextEncoderWrapper(model, rbln_config.hidden_states_layers).eval()
+
+    @classmethod
+    def _update_rbln_config(
+        cls,
+        preprocessors: Sequence[Preprocessor] | None,
+        model: "PreTrainedModel",
+        model_config: PretrainedConfig,
+        rbln_config: RBLNQwen3VLTextEncoderConfig,
+    ) -> RBLNQwen3VLTextEncoderConfig:
+        text_config = model_config.text_config
+        if rbln_config.max_seq_len is None:
+            rbln_config.max_seq_len = 1040
+        if rbln_config.hidden_states_layers is None:
+            rbln_config.hidden_states_layers = list(range(text_config.num_hidden_layers + 1))
+        if not 0 <= rbln_config.hidden_states_layers[-1] <= text_config.num_hidden_layers:
+            raise ValueError(
+                f"hidden_states_layers must be in [0, {text_config.num_hidden_layers}], "
+                f"got {rbln_config.hidden_states_layers}."
+            )
+
+        head_dim = getattr(text_config, "head_dim", None) or text_config.hidden_size // text_config.num_attention_heads
+        shape = [rbln_config.batch_size, rbln_config.max_seq_len]
+        input_info = [
+            ("input_ids", shape, "int64"),
+            ("attention_mask", shape, rbln_config.dtype),
+            ("position_cos", [*shape, head_dim], rbln_config.dtype),
+            ("position_sin", [*shape, head_dim], rbln_config.dtype),
+        ]
+        rbln_config.set_compile_cfgs([RBLNCompileConfig(input_info=input_info)])
+        return rbln_config
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        **kwargs: Any,
+    ) -> BaseModelOutputWithPast | tuple:
+        """
+        Encodes a batch of prompts and returns the hidden states of the compiled layers.
+
+        Args:
+            input_ids (torch.LongTensor): Token ids of shape `(batch_size, seq_len)`, `seq_len <= max_seq_len`.
+            attention_mask (torch.Tensor | None): 1 for the tokens to attend to, 0 for padding. Defaults to all ones.
+            position_ids (torch.LongTensor | None): Text position ids of shape `(batch_size, seq_len)`. Defaults to
+                `0..seq_len-1`, like the Hugging Face model.
+            output_hidden_states (bool | None): Accepted for compatibility; the hidden states are always returned.
+            return_dict (bool | None): Whether to return a `BaseModelOutputWithPast` instead of a plain tuple.
+            kwargs: Other arguments of the Hugging Face forward (e.g. `use_cache`), ignored.
+
+        Returns:
+            `BaseModelOutputWithPast` (or a tuple) whose `hidden_states` has `num_hidden_layers + 1` entries, like the
+            Hugging Face output; the entries outside `hidden_states_layers` are `None`.
+        """
+        batch_size, seq_len = input_ids.shape
+        max_seq_len = self.rbln_config.max_seq_len
+        if seq_len > max_seq_len:
+            raise ValueError(
+                f"The prompt has {seq_len} tokens, but the encoder was compiled for at most {max_seq_len} "
+                "(`max_seq_len`). Recompile with a larger `max_seq_len`."
+            )
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        if position_ids is None:
+            position_ids = torch.arange(seq_len).expand(batch_size, -1)
+
+        # The positions added to reach the compiled length are masked out as keys and cut from the output.
+        pad = max_seq_len - seq_len
+        input_ids = torch.nn.functional.pad(input_ids, (0, pad))
+        attention_mask = torch.nn.functional.pad(attention_mask, (0, pad))
+        position_ids = torch.nn.functional.pad(position_ids, (0, pad), value=0)
+        # Text-only Qwen3-VL uses the same position on its three M-RoPE axes.
+        cos, sin = self.rotary_emb(
+            torch.empty(0, dtype=torch.float32), position_ids[None].expand(3, -1, -1).to(torch.long)
+        )
+
+        dtype = self.rbln_config.dtype
+        output = self.model[0](input_ids, attention_mask.to(dtype), cos.to(dtype), sin.to(dtype))
+        layers = self.rbln_config.hidden_states_layers
+        per_layer = output[:, :seq_len].chunk(len(layers), dim=-1)
+        hidden_states = [None] * (self.config.text_config.num_hidden_layers + 1)
+        for layer, states in zip(layers, per_layer, strict=True):
+            hidden_states[layer] = states
+        hidden_states = tuple(hidden_states)
+
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
+        if not return_dict:
+            return (None, None, hidden_states)
+        return BaseModelOutputWithPast(hidden_states=hidden_states)
+
+
 __all__ = [
     "RBLNQwen3VLForConditionalGeneration",
     "RBLNQwen3VLModel",
+    "RBLNQwen3VLTextEncoder",
     "RBLNQwen3VLVisionModel",
 ]
