@@ -69,7 +69,7 @@ class ExactTimestepProj(nn.Module):
 
     Elementwise ops on CR13 are bf16/dlfloat16 precision, so phases reaching 1000 rad cannot be computed arithmetically
     (the original formulation gives 10-17 % relative error). Instead:
-      1) a bf16 value t is located exactly with comparisons and power-of-two multiplications (exponent j: t ∈ [2^-j-1, 2^-j),
+      1) a bf16 value t is located exactly with comparisons and power-of-two multiplications (exponent j: t ∈ [2^-j, 2^-j+1),
          mantissa m: 0..127), giving a one-hot row of a table [n_exp·128 + 1, dim] precomputed in fp64;
       2) an fp32 timestep is passed as three bf16 pieces t = h1 + h2 + h3 (`split_timestep`); each piece is looked up and
          the angles are added with cos(a+b) = cos a cos b - sin a sin b, sin(a+b) = sin a cos b + cos a sin b.
@@ -109,7 +109,7 @@ class ExactTimestepProj(nn.Module):
         m = t * scale - 128  # 0..127 (exact)
         onehot_m = (m[:, None] == self.mant[None]).to(dt)  # [N, 128]
         onehot = (onehot_e[:, :, None] * onehot_m[:, None, :]).reshape(t.shape[0], -1)
-        zero = 1 - onehot_e.sum(dim=1, keepdim=True)  # 1 if t < 2^-(n_exp)
+        zero = 1 - onehot_e.sum(dim=1, keepdim=True)  # 1 if t < 2^-(n_exp-1)
         onehot = torch.cat([onehot, zero], dim=1)
         return onehot.to(self.table.dtype) @ self.table
 

@@ -25,7 +25,8 @@ Why (CR13, rebel-compiler dev606):
 Layout here: per device, one static block cache (all layers of the device, `blocks_per_layer` blocks of `part` tokens
 each) and a few attention graphs without weights (one per query chunk size) that every layer shares — the block table
 selects the layer's blocks, so the Init scratch exists once per device. The layer computations (norms, modulation,
-q/k/v, RoPE, output projection, MLP) are per-layer weight graphs whose q/k/v and attention outputs go through the host.
+q/k/v, RoPE, output projection, MLP) are per-layer weight graphs whose hidden state, q/k/v and attention outputs go
+through the host (the hidden state in fp32, see runtime_paged.HIDDEN_DTYPE).
 
 A block of N tokens above one piece (the target, a large condition image) is split in two pieces A, B (≤ PIECE tokens,
 one block each). Keys carry their RoPE, so the order of blocks in a block table does not change attention; per layer:
@@ -122,7 +123,7 @@ DiTPagedMod = (
 
 class DiTPagedPre(_LayerBase):
     """q/k/v of layer `layer` from its input (layer 0: text rows through txt_in, latents through img_in; otherwise the
-    hidden state). inputs: x, mod [1, 4D], rope_idx [3, C] → hidden [C, 4096] bf16, q, k, v [C, H, D] bf16."""
+    hidden state). inputs: x, mod [1, 4D], rope_idx [3, C] → hidden [C, 4096] (hidden dtype), q, k, v [C, H, D] (attention dtype)."""
 
     def __init__(self, shared, layer: int, txt: bool, **dtypes):
         super().__init__(shared, **dtypes)
@@ -139,7 +140,7 @@ class DiTPagedPre(_LayerBase):
 
 class DiTPagedMid(_LayerBase):
     """The rest of layer `layer` (output projection, gated residuals, MLP), then the q/k/v of the next layer (`nxt`).
-    inputs: h [C, 4096] bf16, o [C, H, D] bf16, mod, rope_idx → hidden bf16 (+ q, k, v when nxt)."""
+    inputs: h [C, 4096] (hidden dtype), o [C, H, D] (attention dtype), mod, rope_idx → hidden (+ q, k, v when nxt)."""
 
     def __init__(self, shared, layer: int, nxt: bool, **dtypes):
         super().__init__(shared, **dtypes)

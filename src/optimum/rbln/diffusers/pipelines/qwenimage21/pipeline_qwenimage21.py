@@ -63,6 +63,7 @@ except ImportError as e:  # diffusers < 0.41 has no Qwen-Image 2.1
         "RBLNQwenImage21Pipeline needs a diffusers version that ships `QwenImage21Pipeline` "
         "(diffusers>=0.41, currently the main branch) and transformers>=5.17."
     ) from e
+from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image as PILImage
 from transformers import AutoConfig, Qwen3VLProcessor
 
@@ -146,6 +147,23 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
     def maybe_free_model_hooks(self):  # components are NPU runtimes, there is no CPU offload hook
         pass
 
+    # The prompt embeddings stay fp32 (the original takes the dtype of everything after the text encoder from them), so
+    # the condition images reach the VAE encoder and the text rows reach the DiT in fp32, as in the fp32 original. The
+    # initial noise is still drawn in bf16, like the original in bf16 (the model card dtype), so a seed gives the
+    # same image as there.
+    def prepare_latents(
+        self, images, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None
+    ):
+        if latents is None:
+            h, w = 2 * (int(height) // (self.vae_scale_factor * 2)), 2 * (int(width) // (self.vae_scale_factor * 2))
+            noise = randn_tensor(
+                (batch_size, 1, num_channels_latents, h, w), generator=generator, device=device, dtype=torch.bfloat16
+            )
+            latents = self._pack_latents(noise, batch_size, num_channels_latents, h, w)
+        return super().prepare_latents(
+            images, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=latents
+        )
+
     # Same inputs/outputs as the original `_get_qwen_prompt_embeds`; the text encoder runs on the NPU, one prompt at a
     # time. The original encodes a batch with left padding and an attention mask, which gives every prompt the positions
     # it has alone, so encoding prompts one by one is the same computation; the outputs are then padded like the original.
@@ -208,7 +226,7 @@ class RBLNQwenImage21Pipeline(QwenImage21Pipeline):
                 ids, pos[:, 0].long(), vis_rows=merged, vis_mask=ids == self.image_token_id, deepstack=ds
             )
         # original post-processing: drop the system tokens, image_pad mask
-        return hidden.to(torch.bfloat16)[self._drop_idx :], (ids == self._img_token_id)[self._drop_idx :]
+        return hidden[self._drop_idx :], (ids == self._img_token_id)[self._drop_idx :]
 
     # ------------------------------------------------------------------------------------ load / compile / save
     @staticmethod

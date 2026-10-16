@@ -43,7 +43,7 @@ VAE graphs are compiled at the exact image size the first time a size is used (2
 Two compiler constraints measured on rebel-compiler 0.11.3.dev606 shape the DiT: paged flash attention is wrong across
 cache partitions for chunks of 16384 tokens or more, and the eager paged attention cache must stay below 32768 tokens.
 Requests beyond what the `flash`/`eager`/`xl` caches hold (2048-class outputs with long prefixes) run on the `xxl` DiT
-(below). Its block cache holds 18 prefix blocks of 8960 tokens per layer and context (the limits above, ~160k tokens of
+(below). Its block cache holds 18 prefix blocks of 8960 tokens per layer, shared by the contexts of a request (the limits above, ~160k tokens of
 prefix); a longer prefix raises a `ValueError` that names the limit. With true CFG, a second context that does not fit next to the first is
 rewritten on every call (same result, slower).
 
@@ -52,18 +52,18 @@ Measured end-to-end latency (pipeline call, 8 steps, second run of the same requ
 
 | Case | Output | e2e (s) | DiT 8 steps (s) | VAE (s) |
 |---|---|---|---|---|
-| Text-to-image | 1024² | 2.84 | 2.37 | 0.32 |
-| Text-to-image, RGBA | 1024² | 2.83 | 2.37 | 0.33 |
-| Text-to-image + CFG | 1024² | 5.16 | 4.62 | 0.32 |
-| Text-to-image, 2 prompts × 2 images | 4 × 1024² | 11.51 | 9.80 | 1.28 |
-| Edit, 1 / 2 / 10 references | 1024² | 4.03 / 5.37 / 18.16 | 2.60 / 2.90 / 6.00 | 0.56 / 0.75 / 2.54 |
-| Text-to-image, model-card presets (7) | 2048 class | 37.9 – 45.2 | 28.6 – 29.9 | 9.0 – 15.8 |
-| Edit, model-card example (yacht sketch) | 2048² | 43.28 | 31.16 | 10.70 |
-| Edit, 4 references (xl) | 2528x1632 | 76.03 | 40.58 | 19.87 |
-| Edit, `output_resolution=1536` | 1376x1728 | 118.28 | 37.84 | 11.46 |
-| Edit, 4 / 6 references (xxl) | 2048² | 123.19 / 123.81 | 67.97 / 66.60 | 17.05 / 18.09 |
-| Edit, `output_resolution=2048` (yacht sketch, xxl) | 3456x1216 | 149.75 | 64.68 | 21.35 |
-| Edit, 2 / 3 / 6 references at `output_resolution=2048` (xxl) | 2048² | 151.75 / 172.14 / 246.59 | 69.97 / 74.36 / 87.78 | 16.51 / 17.98 / 25.48 |
+| Text-to-image | 1024² | 2.75 | 2.31 | 0.33 |
+| Text-to-image, RGBA | 1024² | 2.74 | 2.31 | 0.32 |
+| Text-to-image + CFG | 1024² | 5.11 | 4.60 | 0.33 |
+| Text-to-image, 2 prompts × 2 images | 4 × 1024² | 11.09 | 9.45 | 1.27 |
+| Edit, 1 / 2 / 10 references | 1024² | 4.01 / 5.43 / 18.24 | 2.59 / 2.91 / 6.01 | 0.54 / 0.78 / 2.67 |
+| Text-to-image, model-card presets (7) | 2048 class | 38.6 – 45.6 | 29.1 – 30.4 | 9.0 – 16.0 |
+| Edit, model-card example (yacht sketch) | 2048² | 43.56 | 31.13 | 11.00 |
+| Edit, 4 references (xl) | 2528x1632 | 74.94 | 40.50 | 19.36 |
+| Edit, `output_resolution=1536` | 1376x1728 | 117.14 | 37.70 | 11.92 |
+| Edit, 4 / 6 references (xxl) | 2048² | 110.56 / 114.00 | 59.24 / 59.98 | 16.73 / 17.95 |
+| Edit, `output_resolution=2048` (yacht sketch, xxl) | 3456x1216 | 138.64 | 57.65 | 20.72 |
+| Edit, 2 / 3 / 6 references at `output_resolution=2048` (xxl) | 2048² | 153.50 / 173.25 / 253.91 | 61.54 / 66.00 / 84.36 | 15.59 / 16.79 / 25.19 |
 
 The first request after a switch between cache configurations also loads the other DiT models (16-35 s). Requests that
 use prefix-only models load them while writing the prefix (`output_resolution=1536`: 32 one-layer models holding only
@@ -81,33 +81,33 @@ model card) differs from its own fp32 run by about as much or more.
 
 | Case | Output | PSNR NPU vs original fp32 (dB) | original bf16 vs fp32 (dB) |
 |---|---|---|---|
-| text-to-image | 1024x1024 | 29.0 | 26.3 |
-| text-to-image | 2048x2048 | 26.4 | 19.8 |
-| text-to-image | 2528x1696 | 41.0 |  |
-| text-to-image | 1696x2528 | 19.0 |  |
-| text-to-image | 2752x1536 | 20.9 |  |
-| text-to-image | 1536x2752 | 23.9 |  |
-| text-to-image | 2400x1792 | 20.8 |  |
-| text-to-image | 1792x2400 | 34.2 |  |
-| text-to-image, RGBA | 1024x1024 | 31.4 | 22.6 |
-| edit | 1024x1024 | 36.6 | 40.7 |
-| edit, 2 references | 1024x1024 | 44.1 |  |
-| edit | 1024x1024 | 49.7 |  |
-| edit, RGBA | 1024x1024 | 50.3 |  |
+| text-to-image | 1024x1024 | 28.5 | 26.3 |
+| text-to-image | 2048x2048 | 26.8 | 19.8 |
+| text-to-image | 2528x1696 | 42.7 |  |
+| text-to-image | 1696x2528 | 17.7 |  |
+| text-to-image | 2752x1536 | 19.3 |  |
+| text-to-image | 1536x2752 | 23.7 |  |
+| text-to-image | 2400x1792 | 21.4 |  |
+| text-to-image | 1792x2400 | 33.7 |  |
+| text-to-image, RGBA | 1024x1024 | 31.3 | 22.6 |
+| edit | 1024x1024 | 39.1 | 40.7 |
+| edit, 2 references | 1024x1024 | 44.2 |  |
+| edit | 1024x1024 | 47.9 |  |
+| edit, RGBA | 1024x1024 | 50.0 |  |
 | edit, 10 references | 1024x1024 | 14.6 |  |
-| edit | 2048x2048 | 22.1 |  |
-| edit, output_resolution 1536 | 1376x1728 | 31.4 |  |
-| edit, 4 references | 2528x1632 | 31.9 |  |
-| text-to-image, CFG | 1024x1024 | 36.1 |  |
-| text-to-image, no KV cache | 1024x1024 | 43.6 |  |
-| text-to-image | 1024x576 | 35.4 |  |
-| text-to-image, batch of 4 | 1024x1024 | 35.9 / 38.3 / 46.5 / 30.8 |  |
-| edit, output_resolution 2048 | 3456x1216 | 40.2 |  |
-| edit, 4 references | 2048x2048 | 29.3 |  |
-| edit, 6 references | 2048x2048 | 24.1 |  |
-| edit, 2 references, output_resolution 2048 | 2048x2048 | 43.7 |  |
-| edit, 3 references, output_resolution 2048 | 2048x2048 | 18.6 |  |
-| edit, 6 references, output_resolution 2048 | 2048x2048 | 19.9 |  |
+| edit | 2048x2048 | 22.3 |  |
+| edit, output_resolution 1536 | 1376x1728 | 40.9 |  |
+| edit, 4 references | 2528x1632 | 33.1 |  |
+| text-to-image, CFG | 1024x1024 | 33.1 |  |
+| text-to-image, no KV cache | 1024x1024 | 44.8 |  |
+| text-to-image | 1024x576 | 36.4 |  |
+| text-to-image, batch of 4 | 1024x1024 | 35.4 / 37.7 / 44.6 / 33.8 |  |
+| edit, output_resolution 2048 | 3456x1216 | 37.1 |  |
+| edit, 4 references | 2048x2048 | 24.6 |  |
+| edit, 6 references | 2048x2048 | 23.9 |  |
+| edit, 2 references, output_resolution 2048 | 2048x2048 | 38.4 |  |
+| edit, 3 references, output_resolution 2048 | 2048x2048 | 21.7 |  |
+| edit, 6 references, output_resolution 2048 | 2048x2048 | 20.8 |  |
 
 Low values come from cases whose first steps are very sensitive (a collage of 10 references, dense text): small early
 differences move the layout or the strokes. The original in bf16 moves at least as much there (per-step DiT error at
@@ -115,12 +115,13 @@ the first steps, 2400x1792: NPU 6.4 / 1.2 / 0.6 % vs original bf16 8.4 / 5.9 / 4
 vs 13.8 / 9.1 / 6.1 %).
 
 Per denoising step, the DiT error of the NPU (each step started from the fp32 original's latents) is below that of the
-original in bf16 in 188 of the 189 steps of the examples that have a bf16 baseline (all 27). Four precision losses were
+original in bf16 in 188 of the 189 steps (the remaining one: 1.55 % vs 1.54 %) of the examples that have a bf16 baseline (all 27). Four precision losses were
 found this way and fixed (see "CR13 workarounds"): the timestep was rounded to bf16 before the sinusoid (978.5 → 976.6
 at the second step changes the DiT output by 4.5 %); the latents were kept in bf16 between steps (0.25 % rounding per
 step); the xxl graphs passed their hidden state between graphs in bf16 (three times the per-step error of the other
 configurations in the last steps); and the VAE encoder ran in bf16 (condition latents 1.3-1.6 % off, now
-0.7-1.3 %, the original in bf16: 0.5-1.5 %). Mean PSNR over the 27 examples went from 28.8 to 31.2 dB.
+0.7-1.3 %, the original in bf16: 0.5-1.5 %). The prompt embeddings and condition images now also stay fp32 on their way
+to the DiT and the VAE encoder; only the initial noise is drawn in bf16, like the original in bf16. Mean PSNR over the 27 examples went from 28.8 to 31.7 dB.
 
 ## How it works
 
@@ -137,7 +138,7 @@ configurations in the last steps); and the VAE encoder ran in bf16 (condition la
     for all of its layers (20 blocks of 8960 tokens per layer) and a few attention graphs without weights, shared by
     every layer: the block table selects the layer's blocks, so the attention's Init scratch (it grows with query chunk
     × visible cache and is allocated per graph) exists once per device. The layer computations are per-layer weight
-    graphs; q/k/v and attention outputs pass through the host. A block above one piece (the target, a 2048-class
+    graphs; the hidden state (fp32), q/k/v and attention outputs pass through the host. A block above one piece (the target, a 2048-class
     condition image) is split in two pieces A, B of one block each: A's keys/values are written, then B attends over
     the block order (prefix, A, B) and A over (prefix, B, A) — the original bidirectional attention with chunks below
     the flash limit. Small prefix chunks are packed so that they share the layer graph calls.

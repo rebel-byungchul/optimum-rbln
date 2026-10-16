@@ -170,10 +170,7 @@ class RBLNDiTKV:
                                 [tuple(x) for x in pm["executors"]],
                             )
                         )
-                    # chiplet-0 GiB is the binding budget (see UNIFIED); older records only have the total
-                    self.sizes[path] = (
-                        e["chiplet_gib"][0] if "chiplet_gib" in e else sum(e.get("alloc_gib", {}).values()) / 4
-                    )
+                    self.sizes[path] = e["chiplet_gib"][0]  # chiplet-0 GiB is the binding budget (see UNIFIED)
         for v in list(self.models.values()) + list(self.prefix_models.values()):
             v.sort()
         self.devices = list(device) if isinstance(device, list | tuple) else [device]
@@ -311,6 +308,7 @@ class RBLNDiTKV:
         self.loaded.clear()
         if self.paged is not None:
             self.paged.rts = None  # (it holds the xxl runtimes too)
+            self.paged.free_buffers()
         gc.collect()
 
     def _placement(self, cfg):
@@ -432,7 +430,7 @@ class RBLNDiTKV:
                     C = self._pick(cfg, "txt", n)
                     chunks.append(
                         self._chunk(
-                            cfg, "txt", C, rows[o : o + n], s.rope_rows[:, o : o + n], n, lay, mask, valid[o : o + n]
+                            "txt", C, rows[o : o + n], s.rope_rows[:, o : o + n], n, lay, mask, valid[o : o + n]
                         )
                     )
             else:
@@ -441,7 +439,7 @@ class RBLNDiTKV:
                 C = self._pick(cfg, "img", s.length)
                 if C is None:
                     raise ValueError(f"no bucket can hold {s.length} condition image tokens ({cfg})")
-                chunks.append(self._chunk(cfg, "img", C, rows, s.rope_rows, s.length, lay, mask))
+                chunks.append(self._chunk("img", C, rows, s.rope_rows, s.length, lay, mask))
         t0 = time.perf_counter()
         resident = set(self.models[cfg][0][3])
         if all((k, C) in resident for k, C, *_ in chunks):
@@ -452,7 +450,7 @@ class RBLNDiTKV:
         self._tick("dit_prefix", t0)
 
     @staticmethod
-    def _chunk(cfg, kind, C, rows, rope_rows, n, lay, mask, valid=None):
+    def _chunk(kind, C, rows, rope_rows, n, lay, mask, valid=None):
         start = lay.place(C)
         x = torch.zeros(C, rows.shape[-1])
         x[:n] = rows.float()

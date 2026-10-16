@@ -259,3 +259,66 @@ def test_dit_target_goes_after_the_prefixes():
     assert rt._tgt_start("eager", 16896, 15000) == 15000
     with pytest.raises(ValueError):
         rt._tgt_start("eager", 16896, 32256 - 16000)  # no room left in the eager cache
+
+
+class _FakeLayerRuntime:
+    """Stands in for a layer graph: outputs (2·x, x + 1); `bad` runs write a wrong value (a platform disagreement)."""
+
+    def __init__(self, bad=()):
+        self.calls, self.bad = 0, set(bad)
+
+    def run(self, x, out=None):
+        self.calls += 1
+        res = [2 * x, x + 1]
+        if self.calls in self.bad:
+            res[0] = res[0] + 1
+        if out is None:
+            return res
+        for o, r in zip(out, res, strict=True):
+            o.copy_(r)
+        return out
+
+
+def _paged_for_layer_tests():
+    from optimum.rbln.diffusers.pipelines.qwenimage21.dit_paged import BLOCKS_PER_LAYER, PART, PIECE
+    from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_aux import run_verified
+    from optimum.rbln.diffusers.pipelines.qwenimage21.runtime_paged import PagedDiT
+
+    rec = {"l0": 0, "l1": 32, "n_layers": 32, "blocks_per_layer": BLOCKS_PER_LAYER, "part": PART, "piece": PIECE}
+
+    def run_group(rt, args, verify, multi=False):
+        o = run_verified(lambda: rt.run(*args), key="dit")
+        return list(o) if multi else o
+
+    return PagedDiT([(rec, "")], [0], run_group)
+
+
+def test_xxl_layer_calls_reuse_output_buffers():
+    pg = _paged_for_layer_tests()
+    rt = _FakeLayerRuntime()
+    pg._sigs[id(rt)] = (((4,), torch.float32), ((4,), torch.float32))
+    x = torch.arange(4.0)
+    h1, _ = pg._layer(rt, (x,))
+    torch.testing.assert_close(h1, 2 * x)
+    h2, _ = pg._layer(rt, (h1,))  # the input's buffer set is not written by the next call
+    torch.testing.assert_close(h2, 4 * x)
+    assert h2.data_ptr() != h1.data_ptr()
+    h3, _ = pg._layer(rt, (h2,))
+    torch.testing.assert_close(h3, 8 * x)
+    assert len(pg._bufs[pg._sigs[id(rt)]]) == 3  # three rotating sets cover a chain of calls
+
+
+def test_xxl_layer_call_disagreement_falls_back_and_deferred_check_recomputes():
+    pg = _paged_for_layer_tests()
+    rt = _FakeLayerRuntime(bad={2})  # the second run of the first call disagrees
+    pg._sigs[id(rt)] = (((4,), torch.float32), ((4,), torch.float32))
+    x = torch.arange(4.0)
+    h, _ = pg._layer(rt, (x,))
+    torch.testing.assert_close(h, 2 * x)  # recomputed through run_group (runs until two agree)
+    rt2 = _FakeLayerRuntime(bad={1})  # deferred: the disagreement is found by _settle
+    pg._sigs[id(rt2)] = pg._sigs[id(rt)]
+    h, _ = pg._layer(rt2, (x,), defer=True)
+    fixed = pg._settle(None)
+    assert fixed is not None
+    torch.testing.assert_close(fixed[0], 2 * x)
+    assert pg._settle(None) is None  # nothing pending any more

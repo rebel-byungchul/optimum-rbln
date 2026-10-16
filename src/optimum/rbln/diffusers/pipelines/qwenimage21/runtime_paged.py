@@ -24,6 +24,7 @@ Bank layout: one compile context per layer half (the halves sit on different dev
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import time
@@ -62,11 +63,10 @@ def compile_paged(
     npu="RBLN-CR13",
     log=print,
     blocks_per_layer=BLOCKS_PER_LAYER,
-    hidden_dtype=HIDDEN_DTYPE,
-    attn_dtype=ATTN_DTYPE,
 ):
     """Layers [l0, l1) in one compile context (the block cache is shared by its graphs); writes xxl_L{l0}-{l1}.json.
-    hidden_dtype / attn_dtype: dtypes passed between the graphs (hidden state / q, k, v and attention output)."""
+    The tensors passed between the graphs use HIDDEN_DTYPE / ATTN_DTYPE (recorded in the bank record)."""
+    hidden_dtype, attn_dtype = HIDDEN_DTYPE, ATTN_DTYPE
     import rebel
     from rebel.compile_context import CompileContext
 
@@ -189,7 +189,6 @@ def compile_paged(
         comp(f"{name}.mid{li}", DiTPagedMid(shared, li, li + 1 < l1, **dts), [info], [ex], "mid", layer=li)
     rec = {
         "name": name,
-        "cfg": "xxl",
         "paged": True,
         "l0": l0,
         "l1": l1,
@@ -235,7 +234,6 @@ class PagedDiT:
         self.halves = sorted(halves, key=lambda h: h[0]["l0"])  # [(record, dir)]
         self.devices = devices
         self.run_group = run_group
-        self.verify_attention = False
         self.nbl = self.halves[0][0]["blocks_per_layer"]
         self.part = self.halves[0][0]["part"]
         self.P = self.halves[0][0]["piece"]
@@ -248,23 +246,31 @@ class PagedDiT:
         self._bufs = {}  # output signature → reusable output buffer sets of the layer graphs (see _layer)
         self._sigs = {}  # id(runtime) → its output signature
         self._abufs = {}  # (attention graph key, call position) → its output buffer
+        self._obufs = {}  # layer parity → attention-output block of the layer
+        self._pending = None  # (comparison future, runtime, args) of a deferred verification (see _layer)
+        self._cmp = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="xxl-verify")
 
     # ---------------------------------------------------------------- loading
     def placement(self):
         out = []
         for i, (rec, d) in enumerate(self.halves):
             for fe in rec["files"]:
+                if fe["role"] == "mod" and i > 0:  # the first half's modulation graph serves every layer
+                    continue
                 out.append((os.path.join(d, fe["name"] + ".rbln"), self.devices[i % len(self.devices)], fe))
         return out
 
     def bind(self, rts):
-        """rts: runtimes in placement() order."""
-        self._sigs = {}  # new runtime objects
+        """rts: runtimes in placement() order. Also records the output layout of the verified layer graphs (_layer)."""
+        hid, qkv = ((WEIGHT_C["block"], HIDDEN), self.hio), ((WEIGHT_C["block"], H, D), self.aio)
+        self._sigs = {}  # id(runtime) → output [(shape, dtype)]
         self.rts = []
         it = iter(rts)
-        for rec, _ in self.halves:
+        for i, (rec, _) in enumerate(self.halves):
             g = {"attn": {}, "pre": {}, "mid": {}, "post": {}, "l0": rec["l0"], "l1": rec["l1"]}
             for fe in rec["files"]:
+                if fe["role"] == "mod" and i > 0:  # not loaded (placement)
+                    continue
                 rt = next(it)
                 if fe["role"] == "mod":
                     g["mod"] = rt
@@ -272,9 +278,17 @@ class PagedDiT:
                     g["attn"][fe["chunk"]] = rt
                 elif fe["role"] == "pre":
                     g["pre"][fe["key"]] = rt
+                    if fe["key"] == "block":
+                        self._sigs[id(rt)] = (hid, qkv, qkv, qkv)
                 else:
                     g[fe["role"]][fe["layer"]] = rt
+                    if fe["role"] == "mid":  # the last layer of a half returns only the hidden state
+                        self._sigs[id(rt)] = (hid, qkv, qkv, qkv) if fe["layer"] + 1 < rec["l1"] else (hid,)
             self.rts.append(g)
+
+    def free_buffers(self):
+        """Drop the host-side output buffers (~2.5 GB) when the xxl graphs are unloaded."""
+        self._bufs, self._abufs, self._obufs = {}, {}, {}
 
     # ---------------------------------------------------------------- layout
     def capacity_check(self, segs, n_tgt):
@@ -322,28 +336,28 @@ class PagedDiT:
             self._masks[key] = mask
         return torch.tensor([[seq]], dtype=torch.int32), bt, mask
 
-    def _attend(self, g, layer, key, qkv, calls, valid):
+    def _attend(self, g, layer, key, qkv, calls, valid, dest=None):
         """calls: [(blocks, seq, rows)] — one attention call each on rows of q/k/v; returns the outputs per call."""
         outs = []
         for i, (blocks, seq, rows) in enumerate(calls):
             q, k, v = (t[rows] for t in qkv)
             s, bt, mask = self._attn_args(g, layer, blocks, seq, valid)
             # attention graphs are a single op: run once (they never disagreed with themselves; the disagreements come
-            # from large multi-op graphs, which stay verified)
-            if self.verify_attention:
-                outs.append(self.run_group(g["attn"][key], (q, k, v, s, bt, mask), True))
-                continue
-            # the outputs are consumed (assembled or passed to the layer graph) before the next layer's calls, so
-            # each call position reuses one output buffer
-            buf = self._abufs.get((key, i))
-            if buf is None or buf.shape != q.shape:
-                buf = self._abufs[(key, i)] = torch.empty_like(q)
+            # from large multi-op graphs, which stay verified). Outputs go to `dest[i]` when given (a slice of the
+            # layer's attention-output block), otherwise to a buffer of this call position, which the caller copies
+            # out before the next call of the same position
+            buf = dest[i] if dest is not None and dest[i] is not None else None
+            if buf is None:
+                buf = self._abufs.get((key, i))
+                if buf is None or buf.shape != q.shape:
+                    buf = self._abufs[(key, i)] = torch.empty_like(q)
             g["attn"][key].run(q, k, v, s, bt, mask, out=[buf])
             outs.append(buf)
         return outs
 
     def _layer_calls(self, kind, place):
-        """Attention calls of a chunk at one layer: (attention graph key, [(blocks, seq, rows)], assemble(outputs)).
+        """Attention calls of a chunk at one layer: (attention graph key, [(blocks, seq, rows)], assemble(outputs) or
+        None for a split block, whose calls write into the layer's output block).
         place: {"blocks", "s"} for a single chunk at region position s (blocks: the region's blocks up to s's block),
         {"before", "sa", "sb"} for a split block (before: the blocks that precede piece A in logical order)."""
         part = self.part
@@ -358,7 +372,7 @@ class PagedDiT:
             (before + [ba, bb], (n + 1) * part + sb % part, slice(P, 2 * P)),  # B attends prefix + A + B
             (before + [bb, ba], (n + 1) * part + sa % part, slice(0, P)),  # A attends prefix + B + A
         ]
-        return "piece", calls, lambda outs: torch.cat([outs[2], outs[1]])
+        return "piece", calls, None  # outputs: B's rows → [P, 2P), A's rows → [0, P) of the layer's output block
 
     def run_chunk(self, kind, x, rope, t, place, valid, target=False):
         """One chunk through every layer (see run_group); returns the noise prediction for the target."""
@@ -403,7 +417,14 @@ class PagedDiT:
         H_ = None
         for g in self.rts:
             mod, nscale = self._mod(t)
-            if g["l0"] == 0:  # embeddings: text rows through txt_in (one text chunk per call), the rest through img_in
+            single = len(chunks) == 1 and spans[0] == (0, CB)  # one block of rows
+            if g["l0"] == 0 and single:  # embeddings of a single block: the pre graph's outputs as they are
+                img = torch.zeros(CB, LATENT_C)
+                img[: chunks[0][1].shape[0]] = chunks[0][1]
+                H_, *qkv = self._layer(g["pre"]["block"], (img, mod, rope))
+            elif (
+                g["l0"] == 0
+            ):  # embeddings: text rows through txt_in (one text chunk per call), the rest through img_in
                 H_ = torch.zeros(CB, HIDDEN, dtype=self.hio)
                 qkv = [torch.zeros(CB, H, D, dtype=self.aio) for _ in range(3)]
                 img = torch.zeros(CB, LATENT_C)
@@ -430,29 +451,59 @@ class PagedDiT:
                             for dst, src in zip(qkv, res[1:], strict=True):
                                 dst[a:b] = src[a:b]
             else:
+                H_ = self._settle(H_)  # (the last layer of the previous half)
                 H_, *qkv = self._layer(g["pre"]["block"], (H_, mod, rope))
-            for li in range(g["l0"], g["l1"]):
-                if len(chunks) == 1 and spans[0] == (0, CB):  # one block: its attention output is the whole row block
-                    key, calls, assemble = plans[0]
-                    o = assemble(self._attend(g, li, key, qkv, calls, valid))
+            li = g["l0"]
+            while li < g["l1"]:
+                o = self._obufs.get(li % 2)  # the layer's attention-output block (two, alternating by layer)
+                if o is None:
+                    o = self._obufs[li % 2] = torch.empty(CB, H, D, dtype=self.aio)
+                if single and plans[0][2] is None:  # a split block: A's and B's attending calls write into o
+                    key, calls, _ = plans[0]
+                    self._attend(g, li, key, qkv, calls, valid, dest=[None, o[self.P :], o[: self.P]])
                 else:
-                    o = torch.zeros(CB, H, D, dtype=self.aio)
+                    o.zero_()
                     for (a, b), (key, calls, assemble) in zip(spans, plans, strict=True):
                         part_qkv = [t_[a:b] for t_ in qkv]
                         o[a:b] = assemble(self._attend(g, li, key, part_qkv, calls, valid))
+                # the previous layer's verification ran during this layer's attention calls: if its two runs disagreed,
+                # its outputs are recomputed and this layer's attention runs again (rewriting the same cache positions)
+                if self._pending is not None:
+                    fixed = self._settle(None)
+                    if fixed is not None:
+                        H_, qkv = fixed[0], fixed[1:]
+                        continue
                 if li + 1 == self.n_layers:
                     if target:
                         out = self.run_group(g["post"][li], (H_, o, mod, nscale), True)
                     break
-                res = self._layer(g["mid"][li], (H_, o, mod, rope))
+                res = self._layer(g["mid"][li], (H_, o, mod, rope), defer=True)
                 H_, qkv = res[0], res[1:]
+                li += 1
+        if self._pending is not None:  # a prefix group's last layer graph
+            self._settle(None)
         return out
 
-    def _layer(self, rt, args):
+    def _settle(self, H_):
+        """Wait for the deferred verification of the last layer-graph call. If its two runs disagreed, the call is
+        repeated through `run_group` and its outputs are returned (only the hidden state when H_ is given); otherwise
+        H_ (None when not given)."""
+        if self._pending is None:
+            return H_
+        fut, rt, args = self._pending
+        self._pending = None
+        if fut.result():
+            return H_
+        VERIFY_STATS["dit"] += 1
+        res = self.run_group(rt, args, True, multi=True)
+        return res[0] if H_ is not None else res
+
+    def _layer(self, rt, args, defer=False):
         """A verified call of a layer graph (pre/mid: hidden state and q/k/v out) that writes into reused output buffers:
         new output tensors on every call (0.7 GB per call, ~600 calls per request) cost seconds of host time. Two buffer
         sets that do not hold this call's inputs receive the two runs; if they differ, the call is repeated through
-        `run_group` (fresh outputs, run until two agree)."""
+        `run_group` (fresh outputs, run until two agree). defer: the comparison runs in a background thread while the
+        next layer's attention calls run, and _settle checks it before the outputs feed another layer graph."""
         sets = None
         sig = self._sigs.get(id(rt))
         if sig is not None:
@@ -469,6 +520,10 @@ class PagedDiT:
         a, b = sets
         rt.run(*args, out=a)
         rt.run(*args, out=b)
+        if defer:
+            same = self._cmp.submit(lambda: all(torch.equal(x, y) for x, y in zip(a, b, strict=True)))
+            self._pending = (same, rt, args)
+            return list(a)
         if all(torch.equal(x, y) for x, y in zip(a, b, strict=True)):
             return list(a)
         VERIFY_STATS["dit"] += 1
