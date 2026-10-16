@@ -44,6 +44,7 @@ from .dit_paged import (
     PagedAttention,
 )
 from .ops import split_timestep
+from .runtime_aux import VERIFY_STATS
 
 
 HIDDEN, LATENT_C, H, D = 4096, 64, 32, 128
@@ -244,6 +245,9 @@ class PagedDiT:
         self.aio = getattr(torch, rec0.get("attn_dtype", "bfloat16"))
         self.rts = None
         self._mods = {}  # float(t) → (modulation, output-norm scale): the same for every layer and request with that t
+        self._bufs = {}  # output signature → reusable output buffer sets of the layer graphs (see _layer)
+        self._sigs = {}  # id(runtime) → its output signature
+        self._abufs = {}  # (attention graph key, call position) → its output buffer
 
     # ---------------------------------------------------------------- loading
     def placement(self):
@@ -255,6 +259,7 @@ class PagedDiT:
 
     def bind(self, rts):
         """rts: runtimes in placement() order."""
+        self._sigs = {}  # new runtime objects
         self.rts = []
         it = iter(rts)
         for rec, _ in self.halves:
@@ -320,12 +325,21 @@ class PagedDiT:
     def _attend(self, g, layer, key, qkv, calls, valid):
         """calls: [(blocks, seq, rows)] — one attention call each on rows of q/k/v; returns the outputs per call."""
         outs = []
-        for blocks, seq, rows in calls:
+        for i, (blocks, seq, rows) in enumerate(calls):
             q, k, v = (t[rows] for t in qkv)
             s, bt, mask = self._attn_args(g, layer, blocks, seq, valid)
             # attention graphs are a single op: run once (they never disagreed with themselves; the disagreements come
             # from large multi-op graphs, which stay verified)
-            outs.append(self.run_group(g["attn"][key], (q, k, v, s, bt, mask), self.verify_attention))
+            if self.verify_attention:
+                outs.append(self.run_group(g["attn"][key], (q, k, v, s, bt, mask), True))
+                continue
+            # the outputs are consumed (assembled or passed to the layer graph) before the next layer's calls, so
+            # each call position reuses one output buffer
+            buf = self._abufs.get((key, i))
+            if buf is None or buf.shape != q.shape:
+                buf = self._abufs[(key, i)] = torch.empty_like(q)
+            g["attn"][key].run(q, k, v, s, bt, mask, out=[buf])
+            outs.append(buf)
         return outs
 
     def _layer_calls(self, kind, place):
@@ -409,14 +423,14 @@ class PagedDiT:
                         img[a : a + x.shape[0]] = x
                         any_img = True
                 if any_img:
-                    res = self.run_group(g["pre"]["block"], (img, mod, rope), True, multi=True)
+                    res = self._layer(g["pre"]["block"], (img, mod, rope))
                     for (a, b), (kind, *_) in zip(spans, chunks, strict=True):
                         if not kind.startswith("txt"):
                             H_[a:b] = res[0][a:b]
                             for dst, src in zip(qkv, res[1:], strict=True):
                                 dst[a:b] = src[a:b]
             else:
-                H_, *qkv = self.run_group(g["pre"]["block"], (H_, mod, rope), True, multi=True)
+                H_, *qkv = self._layer(g["pre"]["block"], (H_, mod, rope))
             for li in range(g["l0"], g["l1"]):
                 if len(chunks) == 1 and spans[0] == (0, CB):  # one block: its attention output is the whole row block
                     key, calls, assemble = plans[0]
@@ -430,9 +444,35 @@ class PagedDiT:
                     if target:
                         out = self.run_group(g["post"][li], (H_, o, mod, nscale), True)
                     break
-                res = self.run_group(g["mid"][li], (H_, o, mod, rope), True, multi=True)
+                res = self._layer(g["mid"][li], (H_, o, mod, rope))
                 H_, qkv = res[0], res[1:]
         return out
+
+    def _layer(self, rt, args):
+        """A verified call of a layer graph (pre/mid: hidden state and q/k/v out) that writes into reused output buffers:
+        new output tensors on every call (0.7 GB per call, ~600 calls per request) cost seconds of host time. Two buffer
+        sets that do not hold this call's inputs receive the two runs; if they differ, the call is repeated through
+        `run_group` (fresh outputs, run until two agree)."""
+        sets = None
+        sig = self._sigs.get(id(rt))
+        if sig is not None:
+            used = {a.data_ptr() for a in args}
+            pool = self._bufs.setdefault(sig, [])
+            sets = [b for b in pool if b[0].data_ptr() not in used][:2]
+            while len(sets) < 2:  # three sets cover a chain of calls (inputs from one set, outputs into the other two)
+                pool.append([torch.empty(shape, dtype=dt) for shape, dt in sig])
+                sets.append(pool[-1])
+        if sets is None:  # first call of this graph: learn its outputs
+            res = self.run_group(rt, args, True, multi=True)
+            self._sigs[id(rt)] = tuple((tuple(r.shape), r.dtype) for r in res)
+            return res
+        a, b = sets
+        rt.run(*args, out=a)
+        rt.run(*args, out=b)
+        if all(torch.equal(x, y) for x, y in zip(a, b, strict=True)):
+            return list(a)
+        VERIFY_STATS["dit"] += 1
+        return self.run_group(rt, args, True, multi=True)
 
     def _mod(self, t):
         """Modulation inputs of the layer graphs for timestep t (one small graph call per distinct t)."""

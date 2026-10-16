@@ -61,9 +61,9 @@ Measured end-to-end latency (pipeline call, 8 steps, second run of the same requ
 | Edit, model-card example (yacht sketch) | 2048² | 43.28 | 31.16 | 10.70 |
 | Edit, 4 references (xl) | 2528x1632 | 76.03 | 40.58 | 19.87 |
 | Edit, `output_resolution=1536` | 1376x1728 | 118.28 | 37.84 | 11.46 |
-| Edit, 4 / 6 references (xxl) | 2048² | 137.91 / 140.13 | 81.66 / 81.12 | 16.62 / 18.01 |
-| Edit, `output_resolution=2048` (yacht sketch, xxl) | 3456x1216 | 168.74 | 82.27 | 20.92 |
-| Edit, 2 / 3 / 6 references at `output_resolution=2048` (xxl) | 2048² | 174.31 / 198.05 / 282.65 | 84.35 / 88.86 / 103.12 | 16.03 / 18.11 / 25.81 |
+| Edit, 4 / 6 references (xxl) | 2048² | 123.19 / 123.81 | 67.97 / 66.60 | 17.05 / 18.09 |
+| Edit, `output_resolution=2048` (yacht sketch, xxl) | 3456x1216 | 149.75 | 64.68 | 21.35 |
+| Edit, 2 / 3 / 6 references at `output_resolution=2048` (xxl) | 2048² | 151.75 / 172.14 / 246.59 | 69.97 / 74.36 / 87.78 | 16.51 / 17.98 / 25.48 |
 
 The first request after a switch between cache configurations also loads the other DiT models (16-35 s). Requests that
 use prefix-only models load them while writing the prefix (`output_resolution=1536`: 32 one-layer models holding only
