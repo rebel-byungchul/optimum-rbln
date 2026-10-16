@@ -239,9 +239,9 @@ class PagedDiT:
         self.part = self.halves[0][0]["part"]
         self.P = self.halves[0][0]["piece"]
         self.n_layers = self.halves[0][0]["n_layers"]
-        rec0 = self.halves[0][0]  # dtypes passed between the graphs (older banks: one "io_dtype", or bf16)
-        self.hio = getattr(torch, rec0.get("hidden_dtype", rec0.get("io_dtype", "bfloat16")))
-        self.aio = getattr(torch, rec0.get("attn_dtype", rec0.get("io_dtype", "bfloat16")))
+        rec0 = self.halves[0][0]  # dtypes passed between the graphs (banks compiled before these fields: bf16)
+        self.hio = getattr(torch, rec0.get("hidden_dtype", "bfloat16"))
+        self.aio = getattr(torch, rec0.get("attn_dtype", "bfloat16"))
         self.rts = None
         self._mods = {}  # float(t) → (modulation, output-norm scale): the same for every layer and request with that t
 

@@ -61,7 +61,7 @@ class PagedAttention(nn.Module):
 
     def __init__(self, C, bidir, part, heads=32, head_dim=128, attn_dtype=torch.bfloat16):
         super().__init__()
-        self.C, self.bidir, self.part, self.H, self.D, self.io = C, bidir, part, heads, head_dim, attn_dtype
+        self.C, self.bidir, self.part, self.H, self.D, self.aio = C, bidir, part, heads, head_dim, attn_dtype
         self.scale = nn.Parameter(torch.tensor(head_dim**-0.5), requires_grad=False)
 
     def forward(self, q, k, v, seq, bt, mask, kc, vc):
@@ -84,7 +84,7 @@ class PagedAttention(nn.Module):
             mask=mask,
             partition=self.part,
         )
-        return o.view(H, C, D).transpose(0, 1).to(self.io)
+        return o.view(H, C, D).transpose(0, 1).to(self.aio)
 
 
 class _LayerBase(nn.Module):
