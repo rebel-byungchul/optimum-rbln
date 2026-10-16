@@ -47,19 +47,31 @@ from .ops import split_timestep
 
 
 HIDDEN, LATENT_C, H, D = 4096, 64, 32, 128
-IO_DTYPE = torch.float32  # tensors passed between the xxl graphs through the host (bf16 tripled the DiT error)
+# dtypes of the tensors passed between the xxl graphs through the host: the hidden state in fp32 (in bf16 it tripled the
+# DiT error of this configuration), q/k/v and attention outputs in bf16 (fp32 there adds transfer time, not accuracy)
+HIDDEN_DTYPE, ATTN_DTYPE = torch.float32, torch.bfloat16
 
 
 def compile_paged(
-    model, out_dir, l0, l1, n_layers, npu="RBLN-CR13", log=print, blocks_per_layer=BLOCKS_PER_LAYER, io_dtype=IO_DTYPE
+    model,
+    out_dir,
+    l0,
+    l1,
+    n_layers,
+    npu="RBLN-CR13",
+    log=print,
+    blocks_per_layer=BLOCKS_PER_LAYER,
+    hidden_dtype=HIDDEN_DTYPE,
+    attn_dtype=ATTN_DTYPE,
 ):
     """Layers [l0, l1) in one compile context (the block cache is shared by its graphs); writes xxl_L{l0}-{l1}.json.
-    io_dtype: dtype of the tensors passed between the graphs (hidden state, q/k/v, attention output)."""
+    hidden_dtype / attn_dtype: dtypes passed between the graphs (hidden state / q, k, v and attention output)."""
     import rebel
     from rebel.compile_context import CompileContext
 
     os.makedirs(out_dir, exist_ok=True)
-    io = str(io_dtype).split(".")[-1]
+    hio, aio = (str(t).split(".")[-1] for t in (hidden_dtype, attn_dtype))
+    dts = {"hidden_dtype": hidden_dtype, "attn_dtype": attn_dtype}
     name = f"xxl_L{l0}-{l1}"
     rec_path = os.path.join(out_dir, name + ".json")
     if os.path.exists(rec_path):
@@ -103,10 +115,10 @@ def compile_paged(
         "mod",
     )
     for key, (C, bidir) in CHUNKS.items():
-        info = [(n, [C, H, D], io) for n in ("q", "k", "v")]
+        info = [(n, [C, H, D], aio) for n in ("q", "k", "v")]
         info += [("seq", [1, 1], "int32"), ("bt", [nv], "int16"), ("mask", [1, nv * PART], "float32")]
         info += [("xxl_k", list(kc.shape), "float32"), ("xxl_v", list(vc.shape), "float32")]
-        ex = [torch.zeros(C, H, D, dtype=io_dtype) + i for i in range(3)]
+        ex = [torch.zeros(C, H, D, dtype=attn_dtype) + i for i in range(3)]
         ex += [
             torch.zeros(1, 1, dtype=torch.int32),
             torch.arange(nv, dtype=torch.int16),
@@ -116,7 +128,7 @@ def compile_paged(
         ]
         comp(
             f"{name}.attn_{key}",
-            PagedAttention(C, bidir, PART, io_dtype=io_dtype),
+            PagedAttention(C, bidir, PART, attn_dtype=attn_dtype),
             [info],
             [ex],
             "attn",
@@ -128,7 +140,7 @@ def compile_paged(
         if layer == 0:
             xd = HIDDEN if key == "txt" else LATENT_C
             return ("x", [C, xd], "float32"), torch.zeros(C, xd)
-        return ("x", [C, HIDDEN], io), torch.zeros(C, HIDDEN, dtype=io_dtype)
+        return ("x", [C, HIDDEN], hio), torch.zeros(C, HIDDEN, dtype=hidden_dtype)
 
     def rope(C):
         return ("rope_idx", [3, C], "int64"), torch.zeros(3, C, dtype=torch.long)
@@ -141,7 +153,7 @@ def compile_paged(
         (xi, xe), (ri, re) = x_spec(key, C, l0), rope(C)
         comp(
             f"{name}.pre{l0}_{key}",
-            DiTPagedPre(shared, l0, key == "txt", io_dtype=io_dtype),
+            DiTPagedPre(shared, l0, key == "txt", **dts),
             [[xi, ("mod", [1, D4], "float32"), ri]],
             [[xe, torch.zeros(1, D4), re]],
             "pre",
@@ -152,28 +164,28 @@ def compile_paged(
         if li + 1 == n_layers:  # last layer: only the target needs it (prefix chunks end with their K/V writes)
             C = WEIGHT_C["block"]
             info = [
-                ("h", [C, HIDDEN], io),
-                ("o", [C, H, D], io),
+                ("h", [C, HIDDEN], hio),
+                ("o", [C, H, D], aio),
                 ("mod", [1, D4], "float32"),
                 ("nscale", [1, HIDDEN], "float32"),
             ]
             ex = [
-                torch.zeros(C, HIDDEN, dtype=io_dtype),
-                torch.zeros(C, H, D, dtype=io_dtype),
+                torch.zeros(C, HIDDEN, dtype=hidden_dtype),
+                torch.zeros(C, H, D, dtype=attn_dtype),
                 torch.zeros(1, D4),
                 torch.zeros(1, HIDDEN),
             ]
-            comp(f"{name}.post{li}", DiTPagedPost(shared, li, io_dtype=io_dtype), [info], [ex], "post", layer=li)
+            comp(f"{name}.post{li}", DiTPagedPost(shared, li, **dts), [info], [ex], "post", layer=li)
             continue
         ri, re = rope(CB)
-        info = [("h", [CB, HIDDEN], io), ("o", [CB, H, D], io), ("mod", [1, D4], "float32"), ri]
+        info = [("h", [CB, HIDDEN], hio), ("o", [CB, H, D], aio), ("mod", [1, D4], "float32"), ri]
         ex = [
-            torch.zeros(CB, HIDDEN, dtype=io_dtype),
-            torch.zeros(CB, H, D, dtype=io_dtype),
+            torch.zeros(CB, HIDDEN, dtype=hidden_dtype),
+            torch.zeros(CB, H, D, dtype=attn_dtype),
             torch.zeros(1, D4),
             re,
         ]
-        comp(f"{name}.mid{li}", DiTPagedMid(shared, li, li + 1 < l1, io_dtype=io_dtype), [info], [ex], "mid", layer=li)
+        comp(f"{name}.mid{li}", DiTPagedMid(shared, li, li + 1 < l1, **dts), [info], [ex], "mid", layer=li)
     rec = {
         "name": name,
         "cfg": "xxl",
@@ -184,7 +196,8 @@ def compile_paged(
         "blocks_per_layer": blocks_per_layer,
         "part": PART,
         "piece": PIECE,
-        "io_dtype": io,
+        "hidden_dtype": hio,
+        "attn_dtype": aio,
         "files": files,
     }
     with open(rec_path, "w") as f:
@@ -226,7 +239,9 @@ class PagedDiT:
         self.part = self.halves[0][0]["part"]
         self.P = self.halves[0][0]["piece"]
         self.n_layers = self.halves[0][0]["n_layers"]
-        self.io = getattr(torch, self.halves[0][0].get("io_dtype", "bfloat16"))  # dtype passed between the graphs
+        rec0 = self.halves[0][0]  # dtypes passed between the graphs (older banks: one "io_dtype", or bf16)
+        self.hio = getattr(torch, rec0.get("hidden_dtype", rec0.get("io_dtype", "bfloat16")))
+        self.aio = getattr(torch, rec0.get("attn_dtype", rec0.get("io_dtype", "bfloat16")))
         self.rts = None
         self._mods = {}  # float(t) → (modulation, output-norm scale): the same for every layer and request with that t
 
@@ -375,8 +390,8 @@ class PagedDiT:
         for g in self.rts:
             mod, nscale = self._mod(t)
             if g["l0"] == 0:  # embeddings: text rows through txt_in (one text chunk per call), the rest through img_in
-                H_ = torch.zeros(CB, HIDDEN, dtype=self.io)
-                qkv = [torch.zeros(CB, H, D, dtype=self.io) for _ in range(3)]
+                H_ = torch.zeros(CB, HIDDEN, dtype=self.hio)
+                qkv = [torch.zeros(CB, H, D, dtype=self.aio) for _ in range(3)]
                 img = torch.zeros(CB, LATENT_C)
                 any_img = False
                 for (a, b), (kind, x, r, _) in zip(spans, chunks, strict=True):
@@ -407,7 +422,7 @@ class PagedDiT:
                     key, calls, assemble = plans[0]
                     o = assemble(self._attend(g, li, key, qkv, calls, valid))
                 else:
-                    o = torch.zeros(CB, H, D, dtype=self.io)
+                    o = torch.zeros(CB, H, D, dtype=self.aio)
                     for (a, b), (key, calls, assemble) in zip(spans, plans, strict=True):
                         part_qkv = [t_[a:b] for t_ in qkv]
                         o[a:b] = assemble(self._attend(g, li, key, part_qkv, calls, valid))

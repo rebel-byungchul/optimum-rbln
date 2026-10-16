@@ -61,9 +61,9 @@ Measured end-to-end latency (pipeline call, 8 steps, second run of the same requ
 | Edit, model-card example (yacht sketch) | 2048² | 43.28 | 31.16 | 10.70 |
 | Edit, 4 references (xl) | 2528x1632 | 76.03 | 40.58 | 19.87 |
 | Edit, `output_resolution=1536` | 1376x1728 | 118.28 | 37.84 | 11.46 |
-| Edit, 4 / 6 references (xxl) | 2048² | 161.79 / 166.01 | 101.73 / 102.68 | 16.64 / 17.85 |
-| Edit, `output_resolution=2048` (yacht sketch, xxl) | 3456x1216 | 197.41 | 100.53 | 21.31 |
-| Edit, 2 / 3 / 6 references at `output_resolution=2048` (xxl) | 2048² | 220.98 / 249.93 / 348.93 | 104.85 / 108.92 / 123.99 | 15.14 / 16.11 / 24.20 |
+| Edit, 4 / 6 references (xxl) | 2048² | 137.91 / 140.13 | 81.66 / 81.12 | 16.62 / 18.01 |
+| Edit, `output_resolution=2048` (yacht sketch, xxl) | 3456x1216 | 168.74 | 82.27 | 20.92 |
+| Edit, 2 / 3 / 6 references at `output_resolution=2048` (xxl) | 2048² | 174.31 / 198.05 / 282.65 | 84.35 / 88.86 / 103.12 | 16.03 / 18.11 / 25.81 |
 
 The first request after a switch between cache configurations also loads the other DiT models (16-35 s). Requests that
 use prefix-only models load them while writing the prefix (`output_resolution=1536`: 32 one-layer models holding only
@@ -102,12 +102,12 @@ model card) differs from its own fp32 run by about as much or more.
 | text-to-image, no KV cache | 1024x1024 | 43.6 |  |
 | text-to-image | 1024x576 | 35.4 |  |
 | text-to-image, batch of 4 | 1024x1024 | 35.9 / 38.3 / 46.5 / 30.8 |  |
-| edit, output_resolution 2048 | 3456x1216 | 36.8 |  |
-| edit, 4 references | 2048x2048 | 27.1 |  |
-| edit, 6 references | 2048x2048 | 24.2 |  |
-| edit, 2 references, output_resolution 2048 | 2048x2048 | 40.7 |  |
-| edit, 3 references, output_resolution 2048 | 2048x2048 | 16.5 |  |
-| edit, 6 references, output_resolution 2048 | 2048x2048 | 20.7 |  |
+| edit, output_resolution 2048 | 3456x1216 | 40.2 |  |
+| edit, 4 references | 2048x2048 | 29.3 |  |
+| edit, 6 references | 2048x2048 | 24.1 |  |
+| edit, 2 references, output_resolution 2048 | 2048x2048 | 43.7 |  |
+| edit, 3 references, output_resolution 2048 | 2048x2048 | 18.6 |  |
+| edit, 6 references, output_resolution 2048 | 2048x2048 | 19.9 |  |
 
 Low values come from cases whose first steps are very sensitive (a collage of 10 references, dense text): small early
 differences move the layout or the strokes. The original in bf16 moves at least as much there (per-step DiT error at
@@ -118,9 +118,9 @@ Per denoising step, the DiT error of the NPU (each step started from the fp32 or
 original in bf16 in 188 of the 189 steps of the examples that have a bf16 baseline (all 27). Four precision losses were
 found this way and fixed (see "CR13 workarounds"): the timestep was rounded to bf16 before the sinusoid (978.5 → 976.6
 at the second step changes the DiT output by 4.5 %); the latents were kept in bf16 between steps (0.25 % rounding per
-step); the xxl graphs passed their hidden state, q/k/v and attention output in bf16 (three times the per-step error of
-the other configurations in the last steps); and the VAE encoder ran in bf16 (condition latents 1.3-1.6 % off, now
-0.7-1.3 %, the original in bf16: 0.5-1.5 %). Mean PSNR over the 27 examples went from 28.8 to 31.3 dB.
+step); the xxl graphs passed their hidden state between graphs in bf16 (three times the per-step error of the other
+configurations in the last steps); and the VAE encoder ran in bf16 (condition latents 1.3-1.6 % off, now
+0.7-1.3 %, the original in bf16: 0.5-1.5 %). Mean PSNR over the 27 examples went from 28.8 to 31.2 dB.
 
 ## How it works
 
@@ -162,9 +162,10 @@ the other configurations in the last steps); and the VAE encoder ran in bf16 (co
   comparisons and looked up, and the angles are added (`ops.ExactTimestepProj`). The DiT returns fp32 noise
   predictions, so the scheduler keeps the latents in fp32 between steps, as the fp32 original does. The remaining DiT
   error comes mostly from the attention kernels (0.4-0.9 % per layer on real activations, mainly from rounding the
-  attention logits). The xxl graphs pass their hidden state, q/k/v and attention output in fp32 (`io_dtype` in the
-  bank record; bf16 tripled the per-step error, at about 10 % more xxl latency), and the VAE encoder is compiled in fp32
-  (the decoder stays in bf16: 50.9 dB against the original).
+  attention logits). The xxl graphs pass their hidden state (residual stream) in fp32 and q/k/v and attention outputs
+  in bf16 (`hidden_dtype` / `attn_dtype` in the bank record): a bf16 hidden state tripled the per-step error, fp32
+  q/k/v/attention outputs added transfer time and no accuracy. The VAE encoder is compiled in fp32 (the decoder stays
+  in bf16: 50.9 dB against the original).
 - **Reliability**: large graphs (2048-class DiT layer groups and VAE graphs) now and then return a different result for
   the same input, sometimes with values far out of range. Every graph call except the 1024-class DiT and VAE decoder
   and the single-op xxl attention graphs (0 disagreements in 4800 layer runs / 1200 graph calls / 1728 attention calls)
