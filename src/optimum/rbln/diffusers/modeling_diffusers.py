@@ -538,24 +538,12 @@ class RBLNModularPipelineMixin(RBLNDiffusionMixin):
         ```python
         class RBLNFlux3DistilledModularPipeline(RBLNModularPipelineMixin, Flux3DistilledModularPipeline):
             original_class = Flux3DistilledModularPipeline
-            _submodules = ["text_encoder", "transformer", "vae"]
-            _excluded_blocks = ["prompt_upsampler"]
+            _submodules = ["prompt_upsampler", "text_encoder", "transformer", "vae"]
         ```
 
     Class Variables:
         - `_submodules`: The components compiled for RBLN NPUs.
-        - `_excluded_blocks`: Top-level pipeline blocks removed from the pipeline, for steps whose components are not
-          compiled for RBLN NPUs.
     """
-
-    _excluded_blocks: ClassVar[list[str]] = []
-
-    @classmethod
-    def _init_pipeline(cls, model_id: str, **kwargs: Any) -> Self:
-        blocks = getattr(importlib.import_module("diffusers"), cls.default_blocks_name)()
-        for block_name in cls._excluded_blocks:
-            blocks.sub_blocks.pop(block_name, None)
-        return cls(blocks=blocks, pretrained_model_name_or_path=model_id, **kwargs)
 
     @classmethod
     def from_pretrained(  # type: ignore[override]
@@ -601,7 +589,7 @@ class RBLNModularPipelineMixin(RBLNDiffusionMixin):
                 for submodule_name in cls._submodules
             )
 
-        pipe = cls._init_pipeline(model_id, **kwargs)
+        pipe = cls(pretrained_model_name_or_path=model_id, **kwargs)
         other_components = [
             name
             for name, spec in pipe._component_specs.items()

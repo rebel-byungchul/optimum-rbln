@@ -15,7 +15,7 @@
 from typing import Any
 
 from ....configuration_utils import RBLNModelConfig
-from ....transformers import RBLNQwen3VLTextEncoderConfig
+from ....transformers import RBLNQwen3_5ForConditionalGenerationConfig, RBLNQwen3VLTextEncoderConfig
 from ..models import RBLNAutoencoderKLFlux2Config, RBLNFlux3Transformer2DModelConfig
 
 
@@ -33,16 +33,17 @@ class RBLNFlux3DistilledModularPipelineConfig(RBLNModelConfig):
 
     The image size and the maximum prompt length are fixed at compile time and shared by the submodules: the text
     encoder and the transformer are compiled for the same `max_seq_len`, and the transformer and the VAE for the same
-    image size.
+    image size. The prompt upsampler, which writes the caption the text encoder reads, has its own length.
     """
 
-    submodules = ["text_encoder", "transformer", "vae"]
+    submodules = ["prompt_upsampler", "text_encoder", "transformer", "vae"]
 
     def __init__(
         self,
         text_encoder: RBLNQwen3VLTextEncoderConfig | None = None,
         transformer: RBLNFlux3Transformer2DModelConfig | None = None,
         vae: RBLNAutoencoderKLFlux2Config | None = None,
+        prompt_upsampler: RBLNQwen3_5ForConditionalGenerationConfig | None = None,
         *,
         height: int | None = None,
         width: int | None = None,
@@ -58,6 +59,10 @@ class RBLNFlux3DistilledModularPipelineConfig(RBLNModelConfig):
                 Initialized as RBLNFlux3Transformer2DModelConfig if not provided.
             vae (RBLNAutoencoderKLFlux2Config | None): Configuration for the VAE (decoder only).
                 Initialized as RBLNAutoencoderKLFlux2Config if not provided.
+            prompt_upsampler (RBLNQwen3_5ForConditionalGenerationConfig | None): Configuration for the prompt
+                upsampler. Initialized as RBLNQwen3_5ForConditionalGenerationConfig if not provided, with room for
+                the system prompt and the step's 3584 new tokens (`max_seq_len` 8192, flash attention with
+                `kvcache_partition_len` 4096).
             height (int | None): Height of the generated images, a multiple of 16. Defaults to 1024.
             width (int | None): Width of the generated images, a multiple of 16. Defaults to 1024.
             max_seq_len (int | None): Maximum prompt length in tokens (after the chat template), for the text
@@ -90,6 +95,16 @@ class RBLNFlux3DistilledModularPipelineConfig(RBLNModelConfig):
             batch_size=batch_size,
             sample_size=(height // FLUX3_IMAGE_TO_LATENT, width // FLUX3_IMAGE_TO_LATENT),
             max_seq_len=max_seq_len,
+        )
+        self.prompt_upsampler = self.initialize_submodule_config(
+            prompt_upsampler,
+            cls_name="RBLNQwen3_5ForConditionalGenerationConfig",
+            batch_size=1,
+            max_seq_len=8192,
+            # Flash attention, as upstream tests Qwen3.5: on RBLN-CR13 (rebel-compiler 0.12.1.dev163) the eager
+            # attention build of this model generates garbage after the first token.
+            kvcache_partition_len=4096,
+            visual={"max_seq_len": 4096},
         )
         self.vae = self.initialize_submodule_config(
             vae,

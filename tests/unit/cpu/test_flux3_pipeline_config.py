@@ -12,6 +12,10 @@ def test_defaults_share_the_image_size_and_prompt_length():
     assert config.transformer.sample_size == (64, 64)
     assert config.transformer.max_seq_len == config.text_encoder.max_seq_len == 1040
     assert config.text_encoder.hidden_states_layers == [4, 8, 12, 16, 20, 24, 28, 32]
+    # The upsampler writes the caption: room for its system prompt and 3584 new tokens, flash attention.
+    assert config.prompt_upsampler.max_seq_len == 8192
+    assert config.prompt_upsampler.kvcache_partition_len == 4096
+    assert config.prompt_upsampler.batch_size == 1
 
 
 def test_size_and_prompt_length_reach_every_submodule():

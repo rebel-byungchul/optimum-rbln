@@ -22,12 +22,9 @@ class RBLNFlux3DistilledModularPipeline(RBLNModularPipelineMixin, Flux3Distilled
     """
     RBLN-accelerated step-distilled FLUX.3 modular pipeline (FLUX 3 Image Klein) for text-to-image generation.
 
-    The Qwen3-VL text encoder, the transformer and the VAE decoder run on RBLN NPUs, compiled for one image size and a
-    maximum prompt length (see [`RBLNFlux3DistilledModularPipelineConfig`]).
-
-    The prompt upsampler step is not part of this pipeline yet: pass `prompt` as the full scene caption the model
-    expects, written by the FLUX 3 Image Klein prompt upsampler or by any LLM with its system prompts
-    (`system_prompts.json` in `black-forest-labs/flux-3-image-klein-pup`). Reference images are not supported yet.
+    The prompt upsampler (a Qwen3.5 model that expands the request into the full caption), the Qwen3-VL text encoder,
+    the transformer and the VAE decoder run on RBLN NPUs, compiled for one image size and a maximum prompt length
+    (see [`RBLNFlux3DistilledModularPipelineConfig`]). Reference images are not supported yet.
 
     Example:
         ```python
@@ -36,14 +33,13 @@ class RBLNFlux3DistilledModularPipeline(RBLNModularPipelineMixin, Flux3Distilled
         pipe = RBLNFlux3DistilledModularPipeline.from_pretrained(
             "black-forest-labs/flux-3-image-klein", export=True, model_save_dir="flux3-klein-rbln"
         )
-        image = pipe(prompt=caption, output="images")[0]
+        image = pipe(prompt="A red fox in a snow-covered forest clearing at golden hour", output="images")[0]
         ```
     """
 
     original_class = Flux3DistilledModularPipeline
     _rbln_config_class = RBLNFlux3DistilledModularPipelineConfig
-    _submodules = ["text_encoder", "transformer", "vae"]
-    _excluded_blocks = ["prompt_upsampler"]
+    _submodules = ["prompt_upsampler", "text_encoder", "transformer", "vae"]
 
     def handle_additional_kwargs(self, **kwargs):
         kwargs = super().handle_additional_kwargs(**kwargs)
