@@ -59,9 +59,9 @@ class PagedAttention(nn.Module):
     """Paged flash attention over the block cache, no weights. q, k, v [C, H, D] bf16 → o [C, H, D] bf16.
     seq [1, 1]: logical position of the chunk; bt [nv]: physical blocks in logical order; mask [1, nv × part]."""
 
-    def __init__(self, C, bidir, part, heads=32, head_dim=128):
+    def __init__(self, C, bidir, part, heads=32, head_dim=128, io_dtype=torch.bfloat16):
         super().__init__()
-        self.C, self.bidir, self.part, self.H, self.D = C, bidir, part, heads, head_dim
+        self.C, self.bidir, self.part, self.H, self.D, self.io = C, bidir, part, heads, head_dim, io_dtype
         self.scale = nn.Parameter(torch.tensor(head_dim**-0.5), requires_grad=False)
 
     def forward(self, q, k, v, seq, bt, mask, kc, vc):
@@ -84,13 +84,15 @@ class PagedAttention(nn.Module):
             mask=mask,
             partition=self.part,
         )
-        return o.view(H, C, D).transpose(0, 1).to(torch.bfloat16)
+        return o.view(H, C, D).transpose(0, 1).to(self.io)
 
 
 class _LayerBase(nn.Module):
-    def __init__(self, shared: DiTKVShared, heads=32):
+    """io_dtype: dtype of the hidden state, q/k/v and attention output passed between the graphs (through the host)."""
+
+    def __init__(self, shared: DiTKVShared, heads=32, io_dtype=torch.bfloat16):
         super().__init__()
-        self.sh, self.H = shared, heads
+        self.sh, self.H, self.io = shared, heads, io_dtype
 
     @property
     def m(self):
@@ -109,7 +111,7 @@ class _LayerBase(nn.Module):
         k = attn.norm_k(attn.to_k(h).unflatten(-1, (H, -1)))
         v = attn.to_v(h).unflatten(-1, (H, -1))
         q, k = rope_real(q.to(v.dtype), cos, sin), rope_real(k.to(v.dtype), cos, sin)
-        return tuple(t[0].to(torch.bfloat16) for t in (q, k, v))  # [C, H, D]
+        return tuple(t[0].to(self.io) for t in (q, k, v))  # [C, H, D]
 
 
 DiTPagedMod = (
@@ -121,8 +123,8 @@ class DiTPagedPre(_LayerBase):
     """q/k/v of layer `layer` from its input (layer 0: text rows through txt_in, latents through img_in; otherwise the
     hidden state). inputs: x, mod [1, 4D], rope_idx [3, C] → hidden [C, 4096] bf16, q, k, v [C, H, D] bf16."""
 
-    def __init__(self, shared, layer: int, txt: bool):
-        super().__init__(shared)
+    def __init__(self, shared, layer: int, txt: bool, io_dtype=torch.bfloat16):
+        super().__init__(shared, io_dtype=io_dtype)
         self.layer, self.txt = layer, txt
         self._blk = [shared.m.transformer_blocks[layer]]  # a list: the parameters stay under `sh`
 
@@ -131,15 +133,15 @@ class DiTPagedPre(_LayerBase):
             x = self.m.txt_in(x) if self.txt else self.m.img_in(x)
         x = x.float()[None]
         s1, *_ = self._mod(mod)
-        return (x[0].to(torch.bfloat16), *self._qkv(self._blk[0], x, s1, rope_idx))
+        return (x[0].to(self.io), *self._qkv(self._blk[0], x, s1, rope_idx))
 
 
 class DiTPagedMid(_LayerBase):
     """The rest of layer `layer` (output projection, gated residuals, MLP), then the q/k/v of the next layer (`nxt`).
     inputs: h [C, 4096] bf16, o [C, H, D] bf16, mod, rope_idx → hidden bf16 (+ q, k, v when nxt)."""
 
-    def __init__(self, shared, layer: int, nxt: bool):
-        super().__init__(shared)
+    def __init__(self, shared, layer: int, nxt: bool, io_dtype=torch.bfloat16):
+        super().__init__(shared, io_dtype=io_dtype)
         self.layer, self.nxt = layer, nxt
         blocks = shared.m.transformer_blocks
         self._blks = [blocks[layer], blocks[layer + 1] if nxt else None]
@@ -151,15 +153,15 @@ class DiTPagedMid(_LayerBase):
         x = x + g1 * blk.attn.to_out[0](o.float().flatten(1, 2)[None])
         x = x + g2 * blk.img_mlp(blk.img_norm2(x) * (1 + s2))
         if not self.nxt:
-            return x[0].to(torch.bfloat16) + rope_idx[:1, :1].to(torch.bfloat16) * 0  # (rope_idx: same inputs)
-        return (x[0].to(torch.bfloat16), *self._qkv(self._blks[1], x, s1, rope_idx))
+            return x[0].to(self.io) + rope_idx[:1, :1].to(self.io) * 0  # (rope_idx: same inputs)
+        return (x[0].to(self.io), *self._qkv(self._blks[1], x, s1, rope_idx))
 
 
 class DiTPagedPost(_LayerBase):
     """Last layer of the target: the rest of the layer, then norm_out / proj_out → noise_pred [C, 64] fp32."""
 
-    def __init__(self, shared, layer: int):
-        super().__init__(shared)
+    def __init__(self, shared, layer: int, io_dtype=torch.bfloat16):
+        super().__init__(shared, io_dtype=io_dtype)
         self._blk = [shared.m.transformer_blocks[layer]]
 
     def forward(self, h, o, mod, nscale):

@@ -195,7 +195,9 @@ class RBLNDiTKV:
         self.on_oom = []  # callables that free other device memory (e.g. cached VAE graphs) before a cfg switch retries
         # load the cfg that serves the default 1024 class (xxl only on demand: it fills the devices, and the pipeline's
         # memory hooks are not attached yet)
-        self._runtimes(next(c for c in self.PREFERENCE if c in self.models and c != "xxl"))
+        first = next((c for c in self.PREFERENCE if c in self.models and c != "xxl"), None)
+        if first is not None:
+            self._runtimes(first)
 
     @contextmanager
     def cache_context(self, name):

@@ -142,9 +142,13 @@ class VAERuntime:
         """Drop the cached decoder/encoder runtimes (called when the DiT needs the device memory)."""
         self._dec = self._enc = None
 
-    def _model(self):
-        if self._vae is None:
-            self._vae = self._cls.from_pretrained(self.snapshot, subfolder="vae", torch_dtype=torch.bfloat16).eval()
+    # The decoder is compiled in bf16 (PSNR 50.9 dB against the fp32 original). The encoder is compiled in fp32 (computed
+    # in dlfloat16 on the NPU): in bf16 its condition latents were 1.5 % off (CPU bf16: 0.5-0.9 %), which shows in edits.
+    DTYPES = {"dec": torch.bfloat16, "enc": torch.float32}
+
+    def _model(self, dtype):
+        if self._vae is None or self._vae.dtype != dtype:
+            self._vae = self._cls.from_pretrained(self.snapshot, subfolder="vae", torch_dtype=dtype).eval()
         return self._vae
 
     # ---------------------------------------------------------------- chain compile (with fallbacks)
@@ -157,7 +161,7 @@ class VAERuntime:
             first = [("dec4", V.DECODER_PROGRAM_COARSE, 1)] if H * W <= 64 * 64 else []
             return first + [("dec12", V.DECODER_PROGRAM, n) for n in (4, 3, 6, 2, 8)], {}
         enc_kw = {"tiled": V.ENC_TILED_STEPS, "halo": V.ENC_TILE_HALO, "base": "x", "unit": V.ENC_TILE_UNIT}
-        return [("enc5", V.ENCODER_PROGRAM, n) for n in (1, 2, 3, 4, 6)], enc_kw
+        return [("enc5f", V.ENCODER_PROGRAM, n) for n in (1, 2, 3, 4, 6)], enc_kw
 
     def _chain(self, kind, H, W, min_tiles=1):
         """Compile (once, cached on disk) and return (dir, program, n_tiles, tiling kwargs) for a chain at size H×W
@@ -184,18 +188,19 @@ class VAERuntime:
                 return d, prog, n, kw
             with _LOCK:
                 os.makedirs(d, exist_ok=True)
+                dt = self.DTYPES[kind]
                 model = (
-                    V.QwenImage21VAEDecoder2D(self._model())
+                    V.QwenImage21VAEDecoder2D(self._model(dt))
                     if kind == "dec"
-                    else V.QwenImage21VAEEncoder2D(self._model())
+                    else V.QwenImage21VAEEncoder2D(self._model(dt))
                 )
                 gs = {nm: F(model.eval()).eval() for nm, F, _, _ in prog}
                 # shapes from a small probe (two units high and wide; every op keeps its spatial scale), scaled up
                 probe = 2 * unit
                 start = (
-                    {"z": torch.zeros(1, 64, probe, probe, dtype=torch.bfloat16)}
+                    {"z": torch.zeros(1, 64, probe, probe, dtype=dt)}
                     if kind == "dec"
-                    else {"x": torch.zeros(1, 4, probe, probe, dtype=torch.bfloat16)}
+                    else {"x": torch.zeros(1, 4, probe, probe, dtype=dt)}
                 )
                 with torch.no_grad():
                     env = V.run_program(prog, gs, dict(start))
@@ -209,7 +214,7 @@ class VAERuntime:
                             (
                                 k,
                                 [1, env[k].shape[1], t_rows * env[k].shape[2] // 2, W * env[k].shape[3] // probe],
-                                "bfloat16",
+                                str(dt).split(".")[-1],
                             )
                             for k in ins
                         ]
@@ -349,7 +354,7 @@ class VAERuntime:
     def encode(self, x, return_dict=True):
         """x [1, 4, 1, H, W] ([-1,1]) → mimics the posterior (only mode() is used)"""
         t0 = time.perf_counter()
-        x4 = x[:, :, 0].to(torch.bfloat16).contiguous()
+        x4 = x[:, :, 0].to(self.DTYPES["enc"]).contiguous()
         env = self._run_chain(self._enc_runtimes(*x4.shape[-2:]), {"x": x4})
         z = env["z"].float().unsqueeze(2)
         self.timings.setdefault("vae_encode", []).append(time.perf_counter() - t0)
