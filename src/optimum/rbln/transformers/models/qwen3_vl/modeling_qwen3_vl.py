@@ -1010,6 +1010,11 @@ class RBLNQwen3VLTextEncoder(RBLNModel):
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(self.config.text_config)
 
     @classmethod
+    def update_rbln_config_using_pipe(cls, pipe: Any, rbln_config: Any, submodule_name: str) -> Any:
+        # Diffusion pipeline configs set the prompt length and the layers they read.
+        return rbln_config
+
+    @classmethod
     def _wrap_model_if_needed(cls, model: "PreTrainedModel", rbln_config: RBLNQwen3VLTextEncoderConfig):
         return Qwen3VLTextEncoderWrapper(model, rbln_config.hidden_states_layers).eval()
 

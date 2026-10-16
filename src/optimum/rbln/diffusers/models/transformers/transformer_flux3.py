@@ -32,6 +32,8 @@ from ...configurations import RBLNFlux3Transformer2DModelConfig
 if TYPE_CHECKING:
     from transformers import PretrainedConfig, PreTrainedModel
 
+    from ...modeling_diffusers import RBLNDiffusionMixin, RBLNDiffusionMixinConfig
+
 
 logger = get_logger(__name__)
 
@@ -215,6 +217,13 @@ class RBLNFlux3Transformer2DModel(RBLNModel):
         image_ids = get_image_ids(rbln_config.sample_size, rbln_config.image_rope_scale)
         text_ids = get_text_ids(rbln_config.max_seq_len)
         return Flux3Transformer2DModelWrapper(model, image_ids, text_ids).eval()
+
+    @classmethod
+    def update_rbln_config_using_pipe(
+        cls, pipe: "RBLNDiffusionMixin", rbln_config: "RBLNDiffusionMixinConfig", submodule_name: str
+    ) -> "RBLNDiffusionMixinConfig":
+        # The pipeline config already sets the latent size and the text length it shares with the text encoder.
+        return rbln_config
 
     @classmethod
     def _update_rbln_config(

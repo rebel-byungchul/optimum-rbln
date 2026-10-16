@@ -27,6 +27,8 @@ from .autoencoder_kl import RBLNAutoencoderKL
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
 
+    from ...modeling_diffusers import RBLNDiffusionMixin, RBLNDiffusionMixinConfig
+
 
 class RBLNAutoencoderKLFlux2(RBLNAutoencoderKL):
     """
@@ -54,6 +56,17 @@ class RBLNAutoencoderKLFlux2(RBLNAutoencoderKL):
             track_running_stats=True,
         ).eval()
         self.bn.load_state_dict(artifacts["bn"])
+
+    @classmethod
+    def update_rbln_config_using_pipe(
+        cls, pipe: "RBLNDiffusionMixin", rbln_config: "RBLNDiffusionMixinConfig", submodule_name: str
+    ) -> "RBLNDiffusionMixinConfig":
+        # FLUX pipeline configs set the image size; the transformer has no `sample_size` to derive it from.
+        if getattr(rbln_config, submodule_name).sample_size is None:
+            raise ValueError(
+                f"The pipeline config must set `{submodule_name}.sample_size` for RBLNAutoencoderKLFlux2."
+            )
+        return rbln_config
 
     @classmethod
     def save_torch_artifacts(
