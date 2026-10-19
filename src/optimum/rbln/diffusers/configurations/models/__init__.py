@@ -22,6 +22,7 @@ from ....utils.import_utils import define_import_structure
 if TYPE_CHECKING:
     from .configuration_autoencoder_kl import *
     from .configuration_autoencoder_kl_cosmos import *
+    from .configuration_autoencoder_kl_flux2 import *
     from .configuration_autoencoder_kl_temporal_decoder import *
     from .configuration_autoencoder_kl_wan import *
     from .configuration_controlnet import *
