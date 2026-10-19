@@ -123,7 +123,9 @@ class RBLNBaseModel(SubModulesMixin, PushToHubMixin, PreTrainedModel):
                 self.generation_config = GenerationConfig()
             else:
                 try:
-                    self.generation_config = GenerationConfig.from_pretrained(gen_config_dir, trust_remote_code=True)
+                    self.generation_config = GenerationConfig.from_pretrained(
+                        gen_config_dir, subfolder=subfolder, trust_remote_code=True
+                    )
                 except OSError:
                     # transformers v5 raises when `generation_config.json` is absent (v4 returned a default).
                     self.generation_config = GenerationConfig()
