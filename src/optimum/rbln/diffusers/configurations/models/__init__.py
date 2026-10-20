@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from .configuration_controlnet_cosmos import *
     from .configuration_prior_transformer import *
     from .configuration_transformer_cosmos import *
+    from .configuration_transformer_flux3 import *
     from .configuration_transformer_sd3 import *
     from .configuration_unet_2d_condition import *
     from .configuration_unet_spatio_temporal_condition import *
