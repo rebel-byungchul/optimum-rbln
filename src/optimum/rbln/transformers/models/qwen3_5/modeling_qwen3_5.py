@@ -813,6 +813,10 @@ class RBLNQwen3_5ForConditionalGeneration(RBLNQwenVLBatchSortMixin, RBLNQwen3_5M
         return True
 
     @classmethod
+    def update_rbln_config_using_pipe(cls, pipe: Any, rbln_config: Any, submodule_name: str) -> Any:
+        return rbln_config
+
+    @classmethod
     def _get_compile_context(cls, compile_config, example_inputs):
         return _qwen3_5_build_compile_context(compile_config, example_inputs)
 
