@@ -289,6 +289,16 @@ class RBLNQwen3VLModel(RBLNDecoderOnlyModel):
         if not self.can_generate():
             self.block_tables = torch.arange(self.rbln_config.kvcache_num_blocks, dtype=torch.int16)
 
+    @classmethod
+    def update_rbln_config_using_pipe(cls, pipe: Any, rbln_config: Any, submodule_name: str) -> Any:
+        # As a pipeline's prompt encoder, the pipeline config sets everything.
+        return rbln_config
+
+    @classmethod
+    def _reconstruct_model_if_needed(cls, model: "PreTrainedModel"):
+        # A pipeline hands over the Qwen3VLForConditionalGeneration it loaded: compile its base model (no LM head).
+        return model.model if getattr(model, "lm_head", None) is not None else model
+
     def setup_runtime(self):
         page_table_manager = RBLNPageTableManager(self.rbln_config)
         if self.rbln_config.use_position_ids:

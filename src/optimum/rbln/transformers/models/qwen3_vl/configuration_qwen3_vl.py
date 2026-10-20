@@ -67,8 +67,28 @@ class RBLNQwen3VLModelConfig(RBLNDecoderOnlyModelConfig):
     submodules = ["visual"]
     subclass_non_save_attributes = ["_load_visual_runtime", "memory_budget"]
 
-    def __init__(self, visual: RBLNModelConfig | None = None, _load_visual_runtime: bool = True, **kwargs: Any):
+    def __init__(
+        self,
+        visual: RBLNModelConfig | None = None,
+        _load_visual_runtime: bool = True,
+        final_norm: bool | None = None,
+        exp_silu: bool | None = None,
+        **kwargs: Any,
+    ):
+        """
+        Args:
+            visual (RBLNModelConfig | None): Configuration for the vision encoder component.
+            _load_visual_runtime (bool): Whether to create runtime for the visual encoder submodule.
+            final_norm (bool | None): Whether the output goes through the final RMSNorm of the language model.
+                Prompt encoders of image generation pipelines such as Qwen-Image read the last decoder layer's output
+                before it. Defaults to True.
+            exp_silu (bool | None): On RBLN-CR13, compute the SiLU of the MLPs in the exp form (`replace_silu_for_npu`),
+                which keeps the precision the fused SiLU kernel loses. Defaults to False.
+            kwargs: Additional arguments passed to the parent RBLNDecoderOnlyModelConfig.
+        """
         super().__init__(**kwargs)
+        self.final_norm = True if final_norm is None else final_norm
+        self.exp_silu = bool(exp_silu)
         if not getattr(self, "use_inputs_embeds", True):
             raise ValueError(
                 "RBLNQwen3VLModelConfig requires use_inputs_embeds=True. "
@@ -88,7 +108,13 @@ class RBLNQwen3VLVisionModelConfig(RBLNModelConfig):
     RBLN-optimized Qwen3-VL vision transformer models for processing images and videos.
     """
 
-    def __init__(self, max_seq_len: int | list[int] | None = None, batch_size: int | None = None, **kwargs: Any):
+    def __init__(
+        self,
+        max_seq_len: int | list[int] | None = None,
+        batch_size: int | None = None,
+        exp_gelu: bool | None = None,
+        **kwargs: Any,
+    ):
         """
         Args:
             max_seq_len (int | list[int] | None): Maximum sequence lengths for Vision
@@ -101,6 +127,8 @@ class RBLNQwen3VLVisionModelConfig(RBLNModelConfig):
                 computation. If not provided, a `ValueError` is raised.
             batch_size (int | None): the vision encoder runs one image at a time (the parent config forces
                 this by default), so only `batch_size=1` is supported. Defaults to 1.
+            exp_gelu (bool | None): On RBLN-CR13, compute the tanh GELU of the block MLPs in the exp form
+                (`replace_gelu_tanh_for_npu`), which keeps the precision the tanh kernel loses. Defaults to False.
             kwargs: Additional arguments passed to the parent RBLNModelConfig.
 
         Raises:
@@ -113,6 +141,7 @@ class RBLNQwen3VLVisionModelConfig(RBLNModelConfig):
         if batch_size != 1:
             raise ValueError(f"The Qwen3-VL vision encoder only supports batch_size=1, got {batch_size}.")
         self.batch_size = batch_size
+        self.exp_gelu = bool(exp_gelu)
 
         if max_seq_len is not None:
             if isinstance(max_seq_len, int):

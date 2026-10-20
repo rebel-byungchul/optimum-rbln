@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 from transformers import PreTrainedModel
 
-from ....modeling_activation_utils import replace_silu_for_npu
+from ....modeling_activation_utils import replace_gelu_tanh_for_npu, replace_silu_for_npu
 from ..decoderonly.decoderonly_architecture import (
     DecoderOnlyAttention,
     DecoderOnlyForCausalLM,
@@ -60,6 +60,8 @@ class Qwen3VLVisionModelWrapper(nn.Module):
     ):
         wrapped_blocks = []
         for block in blocks:
+            if rbln_config.exp_gelu:
+                replace_gelu_tanh_for_npu(block.mlp, rbln_config.npu)
             wrapped_blocks.append(Qwen3VLVisionBlock(block, rbln_config))
         return nn.ModuleList(wrapped_blocks)
 
@@ -196,6 +198,8 @@ class Qwen3VL_LanguageModelWrapper(DecoderOnlyWrapper):
     def convert_to_rbln_class(self, model: PreTrainedModel, max_seq_len: int, use_rotary_emb: bool):
         new_layers = []
         for layer_idx, layer in enumerate(self.get_decoder_layers(model)):
+            if getattr(self.rbln_config, "exp_silu", False):
+                replace_silu_for_npu(layer.mlp, self.rbln_config.npu)
             is_sliding = layer_idx in self.rbln_config.sliding_window_layers
             new_self_attn = self.get_rbln_attn_class()(
                 self.get_attn_layer(layer), self.rbln_config, is_sliding=is_sliding
@@ -449,7 +453,8 @@ class Qwen3VLDecoderOnlyModel(DecoderOnlyModel):
                     hidden_states, visual_pos_mask, deepstack_visual_embeds[layer_idx]
                 )
 
-        hidden_states = self.get_last_layernorm()(hidden_states)
+        if getattr(self.rbln_config, "final_norm", True):
+            hidden_states = self.get_last_layernorm()(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
